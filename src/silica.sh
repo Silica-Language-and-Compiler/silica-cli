@@ -382,6 +382,7 @@ $(printf '  %s\n' $candidates)" ;;
       [ -n "$cc" ] || cc=clang
       asflags=(-mmacosx-version-min="${MACOS_MIN_VERSION:-26.0}")
       # Entry symbol is `main`; deep recursion wants a larger main-thread stack.
+      # shellcheck disable=SC2054  # the commas belong to -Wl, they do not separate elements
       ldflags=(-Wl,-e,main -Wl,-stack_size,0x10000000) ;;
     linux-*)
       [ -n "$cc" ] || cc=cc
