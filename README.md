@@ -31,6 +31,7 @@ Hello, world!
 - [Install](#install) on macOS (Apple Silicon), Linux on AArch64, or Linux on x86-64
 - [Commands](#commands): `build`, `run`, `update`, `version`
 - [What a build does](#what-a-build-does)
+- [The specification](#the-specification), installed to `~/.silica/spec`; `silica spec` explains it to AI agents
 - [Contributing and license](#contributing-and-license)
 - [The Silica language](https://github.com/Silica-Language-and-Compiler/silica): [specification](https://github.com/Silica-Language-and-Compiler/silica/blob/main/compiler/design_documents/silica-specification.md), [tutorials](https://github.com/Silica-Language-and-Compiler/silica/tree/main/compiler/tutorials_and_howtos), [roadmap](https://github.com/Silica-Language-and-Compiler/silica/blob/main/ROADMAP.md)
 
@@ -51,6 +52,7 @@ The script:
 1. downloads `silica-cli.tar.gz` from the latest release and checks its SHA-256
 2. unpacks it into `~/.silica/cli` and links `~/.silica/bin/silica` to it
 3. downloads the latest [Silica compiler release](https://github.com/Silica-Language-and-Compiler/silica/releases/latest) for this machine into `~/.silica/bin`
+4. downloads that release's `silica-specification.zip` and unpacks it, flat, into `~/.silica/spec`
 
 Then add the command to your `PATH` (the script prints this line if it is missing):
 
@@ -82,7 +84,8 @@ silica run hello.silica          # build, then execute
 silica run my_app/               # a project folder; main.silica is the entry point
 silica run my_app -- arg1 arg2   # arguments after -- go to the program
 silica build my_app -o bin/app   # choose where the executable goes
-silica update                    # fetch the newest released compiler
+silica update                    # fetch the newest released compiler and specification
+silica spec                      # where the specification is and how to use it (for AI agents)
 silica version                   # CLI version, compiler in use, platform
 ```
 
@@ -131,6 +134,28 @@ A build runs the same three stages as the Silica repository's [project Makefiles
 3. **Link** with `main` as the entry point, plus any archives listed in `silica.link` by FFI wrappers.
 
 The compiler lives in `~/.silica/bin`. It is the `silica-<NNNNNN>-<platform>` asset from the [latest release](https://github.com/Silica-Language-and-Compiler/silica/releases/latest), and `silica-compiler` links to it. When a release has several, the CLI takes the lowest number, which is the newest compiler.
+
+## The specification
+
+The language specification ships with each compiler release as `silica-specification.zip`. Whenever the compiler is downloaded, on the first build or with `silica update`, the CLI also installs that release's specification into `~/.silica/spec`. It is one flat folder of Markdown files, with `silica-specification.md` as the entry point:
+
+```
+~/.silica/
+├── bin/          silica, silica-compiler -> silica-<NNNNNN>-<platform>
+├── spec/         silica-specification.md, silica_ffi_wrapper_specification.md, ROADMAP.md, ...
+└── spec.release  the compiler release the specification came from
+```
+
+`silica spec` prints plain-text instructions, written for AI coding agents, on using the specification. It gives the folder's absolute path, the documents to start with, and how to find a section from a compiler error (`spec:sect3.6.3` points to the heading `3.6.3`) or an error code (`E2008`). It also lists every document with its title. Point an agent at it, for example from `CLAUDE.md` or `AGENTS.md`:
+
+```markdown
+This project is written in Silica. Run `silica spec` before writing or changing Silica code,
+and follow its instructions for reading the language specification.
+```
+
+`silica spec --path` prints only the folder. Both exit 1 when the specification is not installed.
+
+The zip keeps the repository's folder layout, so links between the documents (`../../ROADMAP.md`) are rewritten to bare file names (`ROADMAP.md`) and still work in the flat folder. Links to documents the release does not include stay as they are. `silica update` replaces the folder only when a newer release is out. Unpacking uses `unzip`, falling back to `python3` or `bsdtar`. If none is available, or the download fails, the CLI prints a warning and builds still work.
 
 ## Development
 

@@ -78,6 +78,29 @@ expect "built executable runs"          2 "greetings"     -- "$work/out/greet"
 expect "compile error fails"            1 ""              -- "$cli" build "$work/broken"
 expect "folder without entry fails"     1 ""              -- "$cli" build "$work/no-entry"
 
+# `silica update` installs the specification flat into $SILICA_HOME/spec.
+spec_dir="${SILICA_HOME:-$HOME/.silica}/spec"
+expect "update"                         0 ""              -- "$cli" update
+if [ ! -f "$spec_dir/silica-specification.md" ]; then
+  fail "specification installed" "no $spec_dir/silica-specification.md"
+elif [ -n "$(find "$spec_dir" -mindepth 1 \( -type d -o \! -name '*.md' \))" ]; then
+  fail "specification is flat Markdown" "$(find "$spec_dir" -mindepth 1 \( -type d -o \! -name '*.md' \))"
+else
+  pass "specification is flat Markdown"
+fi
+
+expect "spec --path"                    0 "$spec_dir"     -- "$cli" spec --path
+expect "spec guide"                     0 ""              -- "$cli" spec
+# Capture first: grep -q would close the pipe early and pipefail would report that.
+spec_out="$("$cli" spec 2>&1)"
+if printf '%s\n' "$spec_out" | grep -F "$spec_dir/silica-specification.md" >/dev/null; then
+  pass "spec guide names the specification"
+else
+  fail "spec guide names the specification"
+fi
+expect "spec when not installed fails"  1 ""              -- env SILICA_HOME="$work/empty-home" "$cli" spec
+expect "spec bad option fails"          1 ""              -- "$cli" spec --bogus
+
 if [ -n "$(find "$work/single" -name '*.sams' -not -path '*/.silica-build/*')" ]; then
   fail "source tree stays clean" "compiler output found outside .silica-build"
 else

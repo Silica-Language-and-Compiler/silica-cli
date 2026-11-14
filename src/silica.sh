@@ -3,12 +3,14 @@
 #
 #   silica build <file-or-folder>   compile, assemble and link an executable
 #   silica run   <file-or-folder>   build, then execute it
-#   silica update                   download the latest released compiler
+#   silica update                   download the latest compiler and specification
+#   silica spec [--path]            where the specification is and how to read it (for AI)
 #   silica version                  show which compiler is in use
 #
 # The compiler binary lives in ~/.silica/bin (override with SILICA_HOME). When it is
 # missing, the newest GitHub release is queried and the binary for this machine is
-# downloaded. SILICA_COMPILER=/path/to/silica-compiler skips the download entirely.
+# downloaded, along with the release's specification, unpacked flat into ~/.silica/spec.
+# SILICA_COMPILER=/path/to/silica-compiler skips the download entirely.
 #
 # Written for the bash 3.2 that ships with macOS: no associative arrays, no mapfile.
 set -uo pipefail
@@ -21,6 +23,8 @@ SILICA_HOME="${SILICA_HOME:-$HOME/.silica}"
 SILICA_BIN_DIR="$SILICA_HOME/bin"
 SILICA_INSTALLED_COMPILER="$SILICA_BIN_DIR/silica-compiler"
 SILICA_VERSION_FILE="$SILICA_BIN_DIR/silica-compiler.release"
+SILICA_SPEC_DIR="$SILICA_HOME/spec"
+SILICA_SPEC_VERSION_FILE="$SILICA_HOME/spec.release"  # outside spec/, which holds only .md
 BUILD_DIR_NAME=".silica-build"
 # Library modules: SILICA_STDLIB, else ~/.silica/stdlib when it exists.
 if [ -z "${SILICA_STDLIB:-}" ] && [ -d "$SILICA_HOME/stdlib" ]; then SILICA_STDLIB="$SILICA_HOME/stdlib"; fi
@@ -36,6 +40,7 @@ fi
 
 die()  { printf '%serror:%s %s\n' "$c_red" "$c_off" "$*" >&2; exit 1; }
 info() { printf '%s%s%s\n' "$c_dim" "$*" "$c_off" >&2; }
+warn() { printf '%swarning:%s %s\n' "$c_red" "$c_off" "$*" >&2; }
 step() { printf '%s%12s%s %s\n' "$c_green$c_bold" "$1" "$c_off" "$2" >&2; }
 
 usage() {
@@ -45,7 +50,10 @@ Usage: silica <command> [options] <file-or-folder>
 Commands:
   build <path>    Compile <path> (a .silica file or a project folder) to an executable
   run <path>      Build <path>, then execute it (extra args after -- go to the program)
-  update          Download the latest released compiler into ~/.silica/bin
+  update          Download the latest released compiler into ~/.silica/bin and the
+                  language specification (Markdown) into ~/.silica/spec
+  spec            Explain where the language specification is and how to use it
+                  (written for AI agents; --path prints just the folder)
   version         Print the compiler in use and the release it came from
   help            Show this message
 
@@ -92,40 +100,40 @@ http_get() { # http_get <url> → stdout
   curl -fsSL -H "Accept: application/vnd.github+json" ${auth[@]+"${auth[@]}"} "$1"
 }
 
-# Prints "<tag> <asset-name> <download-url>" for this platform's compiler in the latest release.
-latest_release_asset() {
-  local platform json tag best_name best_url best_num
+# Queries the latest release once and sets:
+#   REL_TAG                       the release tag
+#   REL_COMPILER_NAME/_URL        this platform's compiler asset
+#   REL_SPEC_URL                  silica-specification.zip (empty when the release has none)
+query_latest_release() {
+  local platform json best_num url name num
   platform="$(host_platform)"
   command -v curl >/dev/null 2>&1 || die "curl is required to download the compiler"
   json="$(http_get "https://api.github.com/repos/$SILICA_REPO/releases/latest")" \
     || die "could not query https://github.com/$SILICA_REPO/releases/latest"
 
-  tag="$(printf '%s\n' "$json" | sed -n 's/^ *"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)"
-  [ -n "$tag" ] || die "the latest release of $SILICA_REPO has no tag name"
+  REL_TAG="$(printf '%s\n' "$json" | sed -n 's/^ *"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)"
+  [ -n "$REL_TAG" ] || die "the latest release of $SILICA_REPO has no tag name"
 
   # Hosted compilers are named silica-<NNNNNN>-<platform>; cross compilers carry an extra
   # emit-target component (silica-NNNNNN-ESP32_S3_raw-<platform>) and are skipped. The
   # numbers count down, so the lowest number is the newest compiler.
-  best_name=; best_url=; best_num=
+  REL_COMPILER_NAME=; REL_COMPILER_URL=; REL_SPEC_URL=; best_num=
   while IFS= read -r url; do
-    local name num
     name="${url##*/}"
+    if [ "$name" = silica-specification.zip ]; then REL_SPEC_URL="$url"; continue; fi
     case "$name" in silica-*-"$platform") ;; *) continue ;; esac
     num="${name#silica-}"; num="${num%-"$platform"}"
     case "$num" in ''|*[!0-9]*) continue ;; esac
     if [ -z "$best_num" ] || [ "$num" -lt "$best_num" ]; then
-      best_num="$num"; best_name="$name"; best_url="$url"
+      best_num="$num"; REL_COMPILER_NAME="$name"; REL_COMPILER_URL="$url"
     fi
   done < <(printf '%s\n' "$json" | sed -n 's/^ *"browser_download_url": *"\([^"]*\)".*/\1/p')
 
-  [ -n "$best_url" ] || die "release $tag has no compiler for $platform"
-  printf '%s %s %s\n' "$tag" "$best_name" "$best_url"
+  [ -n "$REL_COMPILER_URL" ] || die "release $REL_TAG has no compiler for $platform"
 }
 
-install_latest_compiler() {
-  local tag name url tmp
-  read -r tag name url < <(latest_release_asset) || exit 1
-  [ -n "${url:-}" ] || exit 1
+install_compiler_from_release() {
+  local tag="$REL_TAG" name="$REL_COMPILER_NAME" url="$REL_COMPILER_URL" tmp
 
   if [ -x "$SILICA_INSTALLED_COMPILER" ] && [ -f "$SILICA_VERSION_FILE" ] \
      && [ "$(cat "$SILICA_VERSION_FILE")" = "$tag $name" ]; then
@@ -148,6 +156,89 @@ install_latest_compiler() {
   step Installed "$SILICA_INSTALLED_COMPILER -> $name"
 }
 
+unzip_to() { # unzip_to <zip> <dir>
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -q -o "$1" -d "$2"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -I -m zipfile -e "$1" "$2"
+  elif command -v bsdtar >/dev/null 2>&1; then
+    bsdtar -xf "$1" -C "$2"
+  else
+    warn "need unzip, python3 or bsdtar to unpack the specification"
+    return 1
+  fi
+}
+
+# Installs the release's silica-specification.zip into ~/.silica/spec as a flat folder of
+# Markdown files. The zip keeps repository paths (compiler/design_documents/...), so links
+# between the documents are rewritten to bare file names. Returns 1 (with a warning) on failure;
+# a missing specification never stops a build.
+install_spec_from_release() {
+  local tag="$REL_TAG" url="$REL_SPEC_URL" tmp
+
+  if [ -z "$url" ]; then
+    warn "release $tag has no silica-specification.zip; specification not installed"
+    return 1
+  fi
+  if [ -d "$SILICA_SPEC_DIR" ] && [ -f "$SILICA_SPEC_VERSION_FILE" ] \
+     && [ "$(cat "$SILICA_SPEC_VERSION_FILE")" = "$tag" ]; then
+    info "specification is already the latest ($tag)"
+    return 0
+  fi
+
+  step Downloading "silica-specification.zip ($tag)"
+  mkdir -p "$SILICA_HOME" || die "cannot create $SILICA_HOME"
+  tmp="$(mktemp -d "$SILICA_HOME/.spec.XXXXXX")" || { warn "cannot create a temporary folder in $SILICA_HOME"; return 1; }
+
+  if ! curl -fsSL -o "$tmp/spec.zip" "$url"; then
+    rm -rf "$tmp"; warn "download failed: $url"; return 1
+  fi
+  mkdir -p "$tmp/unzipped" "$tmp/spec"
+  if ! unzip_to "$tmp/spec.zip" "$tmp/unzipped"; then
+    rm -rf "$tmp"; warn "could not unpack silica-specification.zip"; return 1
+  fi
+
+  # Flatten. The release workflow refuses duplicate file names, but guard anyway.
+  local md base count=0
+  while IFS= read -r md; do
+    base="${md##*/}"
+    if [ -e "$tmp/spec/$base" ]; then
+      warn "specification has two files named $base; keeping the first"
+      continue
+    fi
+    mv "$md" "$tmp/spec/$base"
+    count=$((count + 1))
+  done < <(find "$tmp/unzipped" -type f -name '*.md' | LC_ALL=C sort)
+  if [ "$count" -eq 0 ]; then
+    rm -rf "$tmp"; warn "silica-specification.zip holds no Markdown files"; return 1
+  fi
+
+  # ](../../ROADMAP.md) → ](ROADMAP.md), for every file that is part of the flat set.
+  local script="$tmp/links.sed" f
+  : > "$script"
+  for f in "$tmp/spec"/*.md; do
+    base="$(basename "$f" | sed 's/[.[\*^$]/\\&/g')"
+    printf 's#](\\([^)#]*/\\)\\{0,1\\}%s#](%s#g\n' "$base" "$base" >> "$script"
+  done
+  for f in "$tmp/spec"/*.md; do
+    sed -f "$script" "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  done
+
+  rm -rf "$SILICA_SPEC_DIR"
+  mv "$tmp/spec" "$SILICA_SPEC_DIR"
+  printf '%s\n' "$tag" > "$SILICA_SPEC_VERSION_FILE"
+  rm -rf "$tmp"
+  step Installed "$SILICA_SPEC_DIR ($count documents)"
+}
+
+# `silica update`, and the first build: compiler plus specification from the latest release.
+# A specification failure is reported but only fails `silica update` itself.
+install_latest_release() {
+  query_latest_release
+  install_compiler_from_release
+  install_spec_from_release
+}
+
 # Prints the compiler path, downloading it first if needed.
 resolve_compiler() {
   if [ -n "${SILICA_COMPILER:-}" ]; then
@@ -157,7 +248,7 @@ resolve_compiler() {
   fi
   if [ ! -x "$SILICA_INSTALLED_COMPILER" ]; then
     info "no Silica compiler in $SILICA_BIN_DIR; fetching the latest release"
-    install_latest_compiler >&2
+    install_latest_release >&2 || true
   fi
   printf '%s\n' "$SILICA_INSTALLED_COMPILER"
 }
@@ -454,6 +545,116 @@ cmd_build_or_run() {
   fi
 }
 
+# `silica spec`: plain-text instructions for finding and using the specification. Aimed at
+# AI agents, so it is stable, uncoloured, and names absolute paths and exact commands.
+cmd_spec() {
+  case "${1:-}" in
+    '') ;;
+    --path) printf '%s\n' "$SILICA_SPEC_DIR"; [ -f "$SILICA_SPEC_DIR/silica-specification.md" ]; return ;;
+    -h|--help) echo "Usage: silica spec [--path]"; return 0 ;;
+    *) die "unknown option for spec: $1 (expected --path)" ;;
+  esac
+
+  local dir="$SILICA_SPEC_DIR" main_spec="$SILICA_SPEC_DIR/silica-specification.md"
+  if [ ! -f "$main_spec" ]; then
+    cat <<EOF
+# Silica specification
+
+Not installed. Expected at: $dir
+
+Install it (with the latest compiler) by running:
+
+    silica update
+
+Then run \`silica spec\` again.
+EOF
+    return 1
+  fi
+
+  local release="" lines listed=""
+  lines="$(wc -l < "$main_spec" | tr -d ' ')"
+  [ -f "$SILICA_SPEC_VERSION_FILE" ] && release="$(cat "$SILICA_SPEC_VERSION_FILE")"
+
+  cat <<EOF
+# Silica specification
+
+The Silica language specification is installed as a flat folder of Markdown files:
+
+    $dir
+${release:+
+Release: $release. It matches the installed compiler; \`silica update\` refreshes both.
+}
+## What it is for
+
+Silica is a memory-safe, functional systems language with explicit effects, actors and
+region-based memory. It is new and unlikely to be in your training data, so do not guess its
+syntax from other languages. Before writing, changing or reviewing Silica code, read the
+relevant parts of the specification. The compiler rejects anything the specification does not
+allow, including dead bindings, redundant work and missing catch-all arms.
+
+## Where to start
+
+- $main_spec
+  The language specification and the source of truth. Use it for syntax, types, effects,
+  pattern matching, actors, regions, modules and the standard library.
+- $dir/silica-specification-additional.md
+  Additional compiler rules: patterns the compiler rejects as errors even though they parse.
+
+silica-specification.md is large ($lines lines). Search it instead of reading it whole.
+
+## How to look things up
+
+- Sections are numbered headings. A compiler error that says \`spec:sect3.6.3\` or
+  \`(spec 19.3)\` refers to the heading that starts with that number:
+
+      grep -nE '^#+ 3\\.6\\.3 ' "$main_spec"
+
+  Then read from that line to the next heading of the same level.
+- Error codes (E1009, E2008, ...) are explained in the text, often with examples:
+
+      grep -n 'E2008' "$dir"/*.md
+
+- List the table of contents (all section headings):
+
+      grep -nE '^#{2,3} ' "$main_spec"
+
+- Find a keyword or construct across every document:
+
+      grep -n 'sequence proc' "$dir"/*.md
+
+- Links between documents are bare file names in this folder (e.g. ROADMAP.md).
+
+## All documents
+
+EOF
+  # The specification and its additional rules first, then everything else by name.
+  local f title additional="$dir/silica-specification-additional.md"
+  for f in "$main_spec" "$additional" "$dir"/*.md; do
+    [ -f "$f" ] || continue
+    if [ "$f" = "$main_spec" ] || [ "$f" = "$additional" ]; then
+      case " ${listed:-} " in *" $f "*) continue ;; esac
+      listed="${listed:-} $f"
+    fi
+    title="$(sed -n 's/^# //p' "$f" | head -n 1)"
+    printf -- '- %s\n  %s\n' "$(basename "$f")" "${title:-(untitled)}"
+  done
+
+  cat <<'EOF'
+
+The design documents beside the specification (plans, port notes, runtime designs) explain how
+and why things work. The specification wins wherever they disagree.
+
+## Checking your understanding
+
+Compile to confirm that code is valid Silica:
+
+    silica build <file.silica or project folder>
+    silica run   <file.silica or project folder>
+
+A failed build prints the error code and specification section to read next.
+EOF
+}
+
 cmd_version() {
   local compiler
   echo "silica:   $SILICA_CLI_VERSION"
@@ -466,6 +667,11 @@ cmd_version() {
   else
     echo "compiler: not installed (run: silica update)"
   fi
+  if [ -d "$SILICA_SPEC_DIR" ]; then
+    echo "spec:     $SILICA_SPEC_DIR"
+  else
+    echo "spec:     not installed (run: silica update)"
+  fi
   echo "platform: $(host_platform)"
 }
 
@@ -474,7 +680,8 @@ main() {
   local cmd="$1"; shift
   case "$cmd" in
     build|run)           cmd_build_or_run "$cmd" "$@" ;;
-    update)              install_latest_compiler ;;
+    update)              install_latest_release ;;
+    spec)                cmd_spec "$@" ;;
     version|--version)   cmd_version ;;
     help|-h|--help)      usage ;;
     *) printf 'unknown command: %s\n\n' "$cmd" >&2; usage >&2; exit 1 ;;
