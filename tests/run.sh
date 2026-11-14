@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# End-to-end tests for the silica CLI. Runs against a real compiler: the one in
+# $SILICA_HOME/bin (downloaded on first use) or $SILICA_COMPILER.
+#
+#   tests/run.sh
+#
+# Build output goes to a temporary folder, which is removed afterwards.
+set -uo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+root="$(dirname "$here")"
+cli="$root/silica"
+work="$(mktemp -d "${TMPDIR:-/tmp}/silica-cli-tests.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+
+passed=0
+failed=0
+pass() { passed=$((passed + 1)); printf 'ok   %s\n' "$1"; }
+fail() { failed=$((failed + 1)); printf 'FAIL %s\n' "$1"; [ -n "${2:-}" ] && printf '%s\n' "$2" | sed 's/^/     /'; }
+
+# expect <name> <expected-exit> <expected-stdout-or-empty> -- <command...>
+expect() {
+  local name="$1" want_ec="$2" want_out="$3"; shift 4
+  local out ec
+  out="$("$@" 2>"$work/stderr")"; ec=$?
+  if [ "$ec" != "$want_ec" ]; then
+    fail "$name" "exit $ec, wanted $want_ec; stderr:
+$(cat "$work/stderr")"
+  elif [ -n "$want_out" ] && [ "$out" != "$want_out" ]; then
+    fail "$name" "stdout: $out
+wanted: $want_out"
+  else
+    pass "$name"
+  fi
+}
+
+# --- fixtures -------------------------------------------------------------
+
+cp -R "$root/examples/hello-world" "$work/hello-world"
+
+mkdir -p "$work/single"
+cat > "$work/single/greet.silica" <<'EOF'
+fn main() -> atom {
+    sequence proc[device_io]
+        _: atom <- println("greetings")
+    produces
+        pure :ok
+    end
+}
+EOF
+
+mkdir -p "$work/broken"
+cat > "$work/broken/main.silica" <<'EOF'
+fn main() -> atom {
+    this is not silica
+}
+EOF
+
+echo "not a program" > "$work/notes.txt"
+
+mkdir -p "$work/no-entry"
+printf 'fn helper() -> atom {\n    :ok\n}\n' > "$work/no-entry/helper.silica"
+
+# --- tests ----------------------------------------------------------------
+
+expect "version"                        0 "" -- "$cli" version
+expect "help"                           0 "" -- "$cli" help
+expect "unknown command fails"          1 "" -- "$cli" frobnicate
+expect "run without a path fails"       1 "" -- "$cli" run
+expect "missing path fails"             1 "" -- "$cli" build "$work/does-not-exist"
+expect "non-.silica file fails"         1 "" -- "$cli" build "$work/notes.txt"
+
+# A Silica main returning :ok exits with :ok's atom index, 2.
+expect "run example folder"             2 "Hello, world!" -- "$cli" run "$work/hello-world"
+expect "run single file"                2 "greetings"     -- "$cli" run "$work/single/greet.silica"
+expect "build with -o"                  0 ""              -- "$cli" build "$work/single/greet.silica" -o "$work/out/greet"
+expect "built executable runs"          2 "greetings"     -- "$work/out/greet"
+expect "compile error fails"            1 ""              -- "$cli" build "$work/broken"
+expect "folder without entry fails"     1 ""              -- "$cli" build "$work/no-entry"
+
+if [ -n "$(find "$work/single" -name '*.sams' -not -path '*/.silica-build/*')" ]; then
+  fail "source tree stays clean" "compiler output found outside .silica-build"
+else
+  pass "source tree stays clean"
+fi
+
+printf '\n%d passed, %d failed\n' "$passed" "$failed"
+[ "$failed" -eq 0 ]

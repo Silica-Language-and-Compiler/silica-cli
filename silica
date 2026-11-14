@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Convenience launcher for running the CLI from this folder. The implementation is
+# src/silica.sh; install.sh links ~/.silica/bin/silica straight to it.
+exec bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/src/silica.sh" "$@"

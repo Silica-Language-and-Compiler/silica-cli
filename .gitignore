@@ -1,0 +1,23 @@
+# Build output written next to Silica projects by `silica build` / `silica run`
+.silica-build/
+
+# Compiler artifacts, in case the compiler is ever run directly in a source tree
+*.sams
+*.iface
+*.o
+silica.config
+silica.compile.*
+silica.atoms
+silica.shapes
+silica.link
+__silica_runtime.*
+
+# Release packaging (see .github/workflows/ci.yml)
+/dist/
+
+# Editors and OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~

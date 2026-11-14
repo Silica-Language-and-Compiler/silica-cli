@@ -1,0 +1,127 @@
+# Lint and test the silica CLI on every push and pull request; publish a GitHub release
+# when a version tag (v1.2.3) is pushed.
+#
+#   lint     bash -n and shellcheck over every script
+#   test     tests/run.sh on each platform a Silica compiler is released for, using the
+#            latest compiler from Silica-Language-and-Compiler/silica (downloaded by the CLI)
+#   release  packages silica-cli-<tag>.tar.gz (+ .sha256) and creates the release; tags only
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check syntax
+        run: |
+          for f in silica src/silica.sh install.sh tests/run.sh; do
+            bash -n "$f"
+          done
+
+      - name: ShellCheck
+        # shellcheck is preinstalled on GitHub's Ubuntu runners.
+        run: shellcheck --severity=warning silica src/silica.sh install.sh tests/run.sh
+
+  test:
+    name: Test (${{ matrix.platform }})
+    needs: lint
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-applesilicon
+            runner: macos-26
+          - platform: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+    env:
+      GITHUB_TOKEN: ${{ github.token }}  # raises the GitHub API rate limit for the compiler lookup
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use a private SILICA_HOME
+        # The runner context is not available in job-level env, so set it here.
+        run: echo "SILICA_HOME=${RUNNER_TEMP}/silica-home" >> "${GITHUB_ENV}"
+
+      - name: Install
+        run: ./install.sh
+
+      - name: Show versions
+        run: ./silica version
+
+      - name: Run tests
+        run: tests/run.sh
+
+  release:
+    name: Release
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          name="silica-cli-${tag}"
+          stage="dist/silica-cli"
+          mkdir -p "${stage}"
+          cp -R silica install.sh README.md src examples "${stage}/"
+          sed -i "s/^SILICA_CLI_VERSION=\"dev\"\$/SILICA_CLI_VERSION=\"${tag}\"/" "${stage}/src/silica.sh"
+          grep -q "^SILICA_CLI_VERSION=\"${tag}\"\$" "${stage}/src/silica.sh" \
+            || { echo "could not stamp the version into src/silica.sh" >&2; exit 1; }
+          tar -C dist -czf "dist/${name}.tar.gz" silica-cli
+          (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+          echo "tarball=dist/${name}.tar.gz" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          notes="$(mktemp)"
+          {
+            echo "## Install"
+            echo
+            echo '```bash'
+            echo "curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/silica-cli-${tag}.tar.gz | tar -xz"
+            echo "./silica-cli/install.sh"
+            echo '```'
+            echo
+            echo "\`install.sh\` links \`~/.silica/bin/silica\` and downloads the latest Silica compiler for this machine."
+          } > "${notes}"
+          prerelease=()
+          case "${tag}" in *-*) prerelease=(--prerelease) ;; esac
+          gh release create "${tag}" \
+            "${{ steps.package.outputs.tarball }}" \
+            "${{ steps.package.outputs.tarball }}.sha256" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "silica-cli ${tag}" \
+            --notes-file "${notes}" \
+            --generate-notes \
+            "${prerelease[@]}"
