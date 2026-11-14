@@ -1,10 +1,15 @@
-# Lint and test the silica CLI on every push and pull request; publish a GitHub release
-# when a version tag (v1.2.3) is pushed.
+# Lint and test the silica CLI on every push and pull request. Every push to main (a merged
+# pull request, or a commit pushed straight to main) that passes the tests is published as a
+# GitHub release.
+#
+# Versions: a push to main releases the newest vX.Y.Z tag with its patch number bumped
+# (v0.1.0 when there is none yet). To move the minor or major number, push a tag such as
+# v0.2.0 yourself; that tag is released as is, and the next merge continues from it (v0.2.1).
 #
 #   lint     bash -n and shellcheck over every script
 #   test     tests/run.sh on each platform a Silica compiler is released for, using the
 #            latest compiler from Silica-Language-and-Compiler/silica (downloaded by the CLI)
-#   release  publishes silica-cli.tar.gz (+ .sha256) and install.sh as release assets; tags only
+#   release  publishes silica-cli.tar.gz (+ .sha256) and install.sh as release assets
 name: CI
 
 on:
@@ -73,12 +78,41 @@ jobs:
   release:
     name: Release
     needs: test
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0  # all tags, to find the latest version
+
+      - name: Choose the version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            latest="$(git tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)"
+            if [ -z "${latest}" ]; then
+              tag="v0.1.0"
+            else
+              IFS=. read -r major minor patch <<< "${latest#v}"
+              tag="v${major}.${minor}.$((patch + 1))"
+            fi
+          fi
+          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "release ${tag} already exists" >&2
+            exit 1
+          fi
+          echo "Releasing ${tag}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Package
         # Asset names carry no version, so releases/latest/download/<asset> always resolves;
@@ -86,7 +120,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
+          tag="${{ steps.version.outputs.tag }}"
           stage="dist/silica-cli"
           mkdir -p "${stage}"
           cp -R silica install.sh README.md src examples "${stage}/"
@@ -103,7 +137,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
+          tag="${{ steps.version.outputs.tag }}"
           notes="$(mktemp)"
           {
             echo "## Install"
@@ -120,11 +154,14 @@ jobs:
           } > "${notes}"
           prerelease=()
           case "${tag}" in *-*) prerelease=(--prerelease) ;; esac
+          # On main this creates the tag at the commit that was tested. A tag made with
+          # GITHUB_TOKEN does not trigger another workflow run.
           gh release create "${tag}" \
             dist/silica-cli.tar.gz \
             dist/silica-cli.tar.gz.sha256 \
             dist/install.sh \
             --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
             --title "silica-cli ${tag}" \
             --notes-file "${notes}" \
             --generate-notes \

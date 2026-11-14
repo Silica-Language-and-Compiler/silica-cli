@@ -150,13 +150,13 @@ tests/run.sh
 
 CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `bash -n` and ShellCheck on every push and pull request. It then runs `tests/run.sh` on macOS on Apple Silicon, Linux on AArch64 and Linux on x86-64.
 
-**Releasing.** Push a version tag:
+**Releasing.** Every merge to `main` (or commit pushed straight to it) is released once the tests pass. Each release bumps the patch number of the newest `vX.Y.Z` tag, starting at `v0.1.0`. To move the minor or major number, push that tag yourself:
 
 ```bash
-git tag v0.1.0 && git push origin v0.1.0
+git tag v0.2.0 && git push origin v0.2.0   # released as v0.2.0; the next merge becomes v0.2.1
 ```
 
-Once the tests pass, the workflow publishes `silica-cli.tar.gz` (with the tag stamped into `silica version`), its `.sha256`, and `install.sh` as release assets. The asset names carry no version, so the `releases/latest/download/install.sh` URL always points at the newest release. A tag with a hyphen, such as `v0.2.0-rc1`, is marked as a pre-release, and `latest` skips it.
+A release holds `silica-cli.tar.gz` (with the version stamped into `silica version`), its `.sha256`, and `install.sh`. The asset names carry no version, so the `releases/latest/download/install.sh` URL always points at the newest release. A tag you push with a hyphen, such as `v0.3.0-rc1`, is marked as a pre-release; `latest` skips it, and so does the version bump.
 
 ## Contributing and license
 
