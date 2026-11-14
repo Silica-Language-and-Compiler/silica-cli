@@ -3,7 +3,7 @@
 #
 #   silica build <file-or-folder>   compile, assemble and link an executable
 #   silica run   <file-or-folder>   build, then execute it
-#   silica update                   download the latest compiler and specification
+#   silica update                   download the latest compiler, specification and stdlib
 #   silica spec [--path]            where the specification is and how to read it (for AI)
 #   silica version                  show which compiler is in use
 #
@@ -25,9 +25,12 @@ SILICA_INSTALLED_COMPILER="$SILICA_BIN_DIR/silica-compiler"
 SILICA_VERSION_FILE="$SILICA_BIN_DIR/silica-compiler.release"
 SILICA_SPEC_DIR="$SILICA_HOME/spec"
 SILICA_SPEC_VERSION_FILE="$SILICA_HOME/spec.release"  # outside spec/, which holds only .md
+SILICA_STDLIB_DIR="$SILICA_HOME/stdlib"
+SILICA_STDLIB_VERSION_FILE="$SILICA_HOME/stdlib.release"
 BUILD_DIR_NAME=".silica-build"
-# Library modules: SILICA_STDLIB, else ~/.silica/stdlib when it exists.
-if [ -z "${SILICA_STDLIB:-}" ] && [ -d "$SILICA_HOME/stdlib" ]; then SILICA_STDLIB="$SILICA_HOME/stdlib"; fi
+# Library modules: SILICA_STDLIB, else ~/.silica/stdlib when it exists (a build that needs it
+# downloads it first; see ensure_stdlib).
+if [ -z "${SILICA_STDLIB:-}" ] && [ -d "$SILICA_STDLIB_DIR" ]; then SILICA_STDLIB="$SILICA_STDLIB_DIR"; fi
 
 # ---------------------------------------------------------------------------
 # output helpers
@@ -50,8 +53,9 @@ Usage: silica <command> [options] <file-or-folder>
 Commands:
   build <path>    Compile <path> (a .silica file or a project folder) to an executable
   run <path>      Build <path>, then execute it (extra args after -- go to the program)
-  update          Download the latest released compiler into ~/.silica/bin and the
-                  language specification (Markdown) into ~/.silica/spec
+  update          Download the latest released compiler into ~/.silica/bin, the
+                  language specification (Markdown) into ~/.silica/spec and the
+                  standard library sources into ~/.silica/stdlib
   spec            Explain where the language specification is and how to use it
                   (written for AI agents; --path prints just the folder)
   version         Print the compiler in use and the release it came from
@@ -67,7 +71,7 @@ Environment:
   SILICA_HOME       Install root (default: ~/.silica)
   SILICA_STDLIB     A folder of library .silica modules; a `use X;` that is not part of
                     the project is resolved to $SILICA_STDLIB/**/X.silica
-                    (default: ~/.silica/stdlib, when that folder exists)
+                    (default: ~/.silica/stdlib, downloaded when first needed)
   GITHUB_TOKEN      Optional; raises the GitHub API rate limit when downloading
 
 Examples:
@@ -231,12 +235,66 @@ install_spec_from_release() {
   step Installed "$SILICA_SPEC_DIR ($count documents)"
 }
 
-# `silica update`, and the first build: compiler plus specification from the latest release.
-# A specification failure is reported but only fails `silica update` itself.
+# Installs the standard library sources (compiler/stdlib at the release's tag: .silica modules
+# plus the .meta sidecars and C sources of their FFI wrappers) into ~/.silica/stdlib. A release
+# ships only the compiler binary, so they are fetched from the repository itself: one tree query,
+# then the raw files in a single curl run. A folder the CLI did not install (no stdlib.release)
+# is the user's own and is left alone. Returns 1 (with a warning) on failure.
+install_stdlib_from_release() { # install_stdlib_from_release <tag>
+  local tag="$1" tmp json path
+
+  if [ -d "$SILICA_STDLIB_DIR" ] && [ ! -f "$SILICA_STDLIB_VERSION_FILE" ]; then
+    info "$SILICA_STDLIB_DIR was not installed by silica; leaving it as it is"
+    return 0
+  fi
+  if [ -d "$SILICA_STDLIB_DIR" ] && [ "$(cat "$SILICA_STDLIB_VERSION_FILE")" = "$tag" ]; then
+    info "standard library is already the latest ($tag)"
+    return 0
+  fi
+  command -v curl >/dev/null 2>&1 || { warn "curl is required to download the standard library"; return 1; }
+
+  step Downloading "standard library ($tag)"
+  mkdir -p "$SILICA_HOME" || die "cannot create $SILICA_HOME"
+  tmp="$(mktemp -d "$SILICA_HOME/.stdlib.XXXXXX")" || { warn "cannot create a temporary folder in $SILICA_HOME"; return 1; }
+
+  if ! json="$(http_get "https://api.github.com/repos/$SILICA_REPO/git/trees/$tag:compiler/stdlib?recursive=1")"; then
+    rm -rf "$tmp"; warn "could not list compiler/stdlib at $tag"; return 1
+  fi
+  # Each tree entry prints "path" before "type"; keep the blobs that are sources.
+  : > "$tmp/curl.cfg"
+  local count=0
+  while IFS= read -r path; do
+    case "$path" in *.silica|*.meta|*.c|*.h) ;; *) continue ;; esac
+    case "$path" in *'"'*|*'\'*) continue ;; esac
+    printf 'url = "https://raw.githubusercontent.com/%s/%s/compiler/stdlib/%s"\noutput = "%s/stdlib/%s"\n' \
+      "$SILICA_REPO" "$tag" "$path" "$tmp" "$path" >> "$tmp/curl.cfg"
+    count=$((count + 1))
+  done < <(printf '%s\n' "$json" | awk '
+    /^ *"path": / { p = $0; sub(/^ *"path": *"/, "", p); sub(/",? *$/, "", p) }
+    /^ *"type": *"blob"/ { print p }')
+  if [ "$count" -eq 0 ]; then
+    rm -rf "$tmp"; warn "compiler/stdlib at $tag holds no sources"; return 1
+  fi
+  if ! curl -fsSL --create-dirs -K "$tmp/curl.cfg"; then
+    rm -rf "$tmp"; warn "downloading the standard library failed"; return 1
+  fi
+
+  rm -rf "$SILICA_STDLIB_DIR"
+  mv "$tmp/stdlib" "$SILICA_STDLIB_DIR"
+  printf '%s\n' "$tag" > "$SILICA_STDLIB_VERSION_FILE"
+  rm -rf "$tmp"
+  step Installed "$SILICA_STDLIB_DIR ($count files)"
+}
+
+# `silica update`, and the first build: compiler, specification and standard library from the
+# latest release. A specification or library failure is reported but only fails `silica update`.
 install_latest_release() {
+  local ec=0
   query_latest_release
   install_compiler_from_release
-  install_spec_from_release
+  install_spec_from_release || ec=1
+  install_stdlib_from_release "$REL_TAG" || ec=1
+  return "$ec"
 }
 
 # Prints the compiler path, downloading it first if needed.
@@ -342,6 +400,74 @@ find_stdlib_module() {
   find "$SILICA_STDLIB" -type f -name "$1.silica" 2>/dev/null | LC_ALL=C sort | head -n 1
 }
 
+# When the project `use`s a module it does not define and no library folder is set, downloads the
+# standard library of the installed compiler's release (a compiler set with SILICA_COMPILER has
+# no known release, so then nothing is downloaded).
+ensure_stdlib() { # ensure_stdlib <build_dir>
+  [ -z "${SILICA_STDLIB:-}" ] || return 0
+  [ -z "${SILICA_COMPILER:-}" ] && [ -f "$SILICA_VERSION_FILE" ] || return 0
+  local mod missing=0
+  for mod in $(cd "$1" && units=() && while IFS= read -r u; do units+=("$u"); done < .units && used_modules "${units[@]}"); do
+    grep -qE "(^|/)$mod\.silica\$" "$1/.units" || { missing=1; break; }
+  done
+  [ "$missing" = 1 ] || return 0
+  install_stdlib_from_release "$(cut -d' ' -f1 "$SILICA_VERSION_FILE")" >&2 || return 0
+  [ -d "$SILICA_STDLIB_DIR" ] && SILICA_STDLIB="$SILICA_STDLIB_DIR"
+}
+
+# FFI wrapper sidecars. The compiler reads a module's `wrapper_meta "<path>"` relative to the
+# build directory, so the project's own dangerous_exposure_source/ is mirrored there file by
+# file (its folders stay real, so archives built later never land in the source tree). A sidecar
+# the project does not provide (a library module's) is taken from SILICA_STDLIB by file name.
+link_ffi_sidecars() { # link_ffi_sidecars <root> <build_dir>
+  local root="$1" build_dir="$2" f meta lib
+  if [ -d "$root/dangerous_exposure_source" ]; then
+    while IFS= read -r f; do
+      mkdir -p "$build_dir/dangerous_exposure_source/$(dirname "$f")"
+      ln -s "$root/dangerous_exposure_source/$f" "$build_dir/dangerous_exposure_source/$f"
+    done < <(cd "$root/dangerous_exposure_source" && find . \( -type f -o -type l \) | sed 's|^\./||')
+  fi
+  [ -n "${SILICA_STDLIB:-}" ] || return 0
+  while IFS= read -r meta; do
+    case "$meta" in ''|/*|*..*) continue ;; esac
+    [ -e "$build_dir/$meta" ] && continue
+    lib="$(find "$SILICA_STDLIB" -name "$(basename "$meta")" \( -type f -o -type l \) 2>/dev/null | LC_ALL=C sort | head -n 1)"
+    [ -n "$lib" ] || continue
+    mkdir -p "$build_dir/$(dirname "$meta")"
+    ln -s "$lib" "$build_dir/$meta"
+  done < <(cd "$build_dir" && while IFS= read -r u; do
+             sed -n 's/^[[:space:]]*wrapper_meta[[:space:]]*"\([^"]*\)".*/\1/p' "$u"
+           done < .units | LC_ALL=C sort -u)
+}
+
+# Prebuilt FFI archives. The compiler requires dangerous_exposure_source/lib/lib<name>.a for each
+# `link_library: "<name>"` a sidecar declares (FFI wrapper specification, silica.link). One the
+# project ships is used as it is; a missing one is built from <name>.c beside the sidecar, which is
+# how the standard library keeps its C wrappers. With no such source the compiler reports E4034.
+build_ffi_archives() { # build_ffi_archives <build_dir> <cc> [cflags...]
+  local build_dir="$1" cc="$2" meta real name archive src
+  shift 2
+  [ -d "$build_dir/dangerous_exposure_source" ] || return 0
+  while IFS= read -r meta; do
+    real="$meta"
+    if [ -L "$real" ]; then
+      real="$(readlink "$meta")"
+      case "$real" in /*) ;; *) real="$(dirname "$meta")/$real" ;; esac
+    fi
+    while IFS= read -r name; do
+      archive="$build_dir/dangerous_exposure_source/lib/lib$name.a"
+      [ -f "$archive" ] && continue
+      src="$(dirname "$real")/$name.c"
+      [ -f "$src" ] || continue
+      command -v ar >/dev/null 2>&1 || die "ar is required to build lib$name.a"
+      step Building "lib$name.a"
+      mkdir -p "$build_dir/.ffi" "$(dirname "$archive")"
+      "$cc" -O2 "$@" -c "$src" -o "$build_dir/.ffi/$name.o" || die "compiling $src failed"
+      ar rcs "$archive" "$build_dir/.ffi/$name.o" || die "creating lib$name.a failed"
+    done < <(sed -n 's/^[[:space:]]*link_library:[[:space:]]*"\([^"]*\)".*/\1/p' "$meta")
+  done < <(find -L "$build_dir/dangerous_exposure_source" -name '*.meta' 2>/dev/null | LC_ALL=C sort)
+}
+
 # ---------------------------------------------------------------------------
 # build
 
@@ -415,6 +541,10 @@ $(printf '  %s\n' $candidates)" ;;
   done < "$units_file"
 
   # Library modules from SILICA_STDLIB for any `use` the project does not satisfy itself.
+  ensure_stdlib "$build_dir"
+  if [ -n "${SILICA_STDLIB:-}" ] && [ -d "$SILICA_STDLIB" ]; then
+    SILICA_STDLIB="$(abs_path "$SILICA_STDLIB")"  # the links below must not be relative
+  fi
   if [ -n "${SILICA_STDLIB:-}" ]; then
     local added=1
     while [ "$added" -eq 1 ]; do
@@ -433,6 +563,30 @@ $(printf '  %s\n' $candidates)" ;;
       done
     done
   fi
+
+  # The C toolchain: it builds any missing FFI archive now, and assembles and links later.
+  local cc asflags ldflags cflags
+  cc="${CC:-}"
+  case "$platform" in
+    macos-*)
+      [ -n "$cc" ] || cc=clang
+      asflags=(-mmacosx-version-min="${MACOS_MIN_VERSION:-26.0}")
+      cflags=("${asflags[@]}")
+      # Entry symbol is `main`; deep recursion wants a larger main-thread stack.
+      # shellcheck disable=SC2054  # the commas belong to -Wl, they do not separate elements
+      ldflags=(-Wl,-e,main -Wl,-stack_size,0x10000000) ;;
+    linux-*)
+      [ -n "$cc" ] || cc=cc
+      asflags=()
+      cflags=(-D_GNU_SOURCE)
+      # crt1.o calls main; data tables hold absolute addresses (-no-pie); the failure banner
+      # resolves behavior names through dladdr (-rdynamic).
+      ldflags=(-no-pie -rdynamic -lpthread) ;;
+  esac
+  command -v "$cc" >/dev/null 2>&1 || die "$cc is required to assemble and link Silica programs"
+
+  link_ffi_sidecars "$root" "$build_dir"
+  build_ffi_archives "$build_dir" "$cc" ${cflags[@]+"${cflags[@]}"}
 
   (cd "$build_dir" && topo_sort .units "$entry") > "$build_dir/silica.config" || die "could not order the modules"
   local count; count="$(grep -c . "$build_dir/silica.config")"
@@ -466,24 +620,6 @@ $(printf '  %s\n' $candidates)" ;;
   done
 
   # Stage 2: assemble every .sams the compiler produced.
-  local cc asflags ldflags
-  cc="${CC:-}"
-  case "$platform" in
-    macos-*)
-      [ -n "$cc" ] || cc=clang
-      asflags=(-mmacosx-version-min="${MACOS_MIN_VERSION:-26.0}")
-      # Entry symbol is `main`; deep recursion wants a larger main-thread stack.
-      # shellcheck disable=SC2054  # the commas belong to -Wl, they do not separate elements
-      ldflags=(-Wl,-e,main -Wl,-stack_size,0x10000000) ;;
-    linux-*)
-      [ -n "$cc" ] || cc=cc
-      asflags=()
-      # crt1.o calls main; data tables hold absolute addresses (-no-pie); the failure banner
-      # resolves behavior names through dladdr (-rdynamic).
-      ldflags=(-no-pie -rdynamic -lpthread) ;;
-  esac
-  command -v "$cc" >/dev/null 2>&1 || die "$cc is required to assemble and link Silica programs"
-
   step Assembling "$name"
   local sams objs=()
   while IFS= read -r sams; do
@@ -671,6 +807,11 @@ cmd_version() {
     echo "spec:     $SILICA_SPEC_DIR"
   else
     echo "spec:     not installed (run: silica update)"
+  fi
+  if [ -n "${SILICA_STDLIB:-}" ]; then
+    echo "stdlib:   $SILICA_STDLIB"
+  else
+    echo "stdlib:   not installed (run: silica update)"
   fi
   echo "platform: $(host_platform)"
 }
