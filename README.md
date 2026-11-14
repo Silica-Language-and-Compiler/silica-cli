@@ -53,6 +53,7 @@ The script:
 2. unpacks it into `~/.silica/cli` and links `~/.silica/bin/silica` to it
 3. downloads the latest [Silica compiler release](https://github.com/Silica-Language-and-Compiler/silica/releases/latest) for this machine into `~/.silica/bin`
 4. downloads that release's `silica-specification.zip` and unpacks it, flat, into `~/.silica/spec`
+5. downloads the standard library sources from that release's tag (`compiler/stdlib`) into `~/.silica/stdlib`
 
 Then add the command to your `PATH` (the script prints this line if it is missing):
 
@@ -117,13 +118,25 @@ error: compilation failed (exit 1); full log: .silica-build/broken/compile.log
 | Variable | Effect |
 | -------- | ------ |
 | `SILICA_COMPILER` | Use this compiler binary, for example `silica/binaries/silica-compiler` from a checkout |
-| `SILICA_STDLIB` | A folder of library modules (default: `~/.silica/stdlib`, if it exists) |
+| `SILICA_STDLIB` | A folder of library modules (default: `~/.silica/stdlib`, downloaded when first needed) |
 | `SILICA_HOME` | Install root (default: `~/.silica`) |
 | `GITHUB_TOKEN` | Raises the GitHub API rate limit for compiler downloads |
 
 ### Library modules
 
-A released compiler ships without the standard library sources (`Supervisor` and the rest). To use them, point `SILICA_STDLIB` at [`compiler/stdlib`](https://github.com/Silica-Language-and-Compiler/silica/tree/main/compiler/stdlib) in a Silica checkout, or copy that folder to `~/.silica/stdlib`. Any `use X;` that the project doesn't satisfy itself resolves to the first `X.silica` under that folder.
+A released compiler ships without the standard library sources (`Supervisor`, `dangerous_tcp_carrier` and the rest). The CLI fetches them for you. `silica update` installs [`compiler/stdlib`](https://github.com/Silica-Language-and-Compiler/silica/tree/main/compiler/stdlib) from the release's tag into `~/.silica/stdlib`, and so does the first build that `use`s a module the project doesn't define. Only the sources are fetched: `.silica` modules, plus the `.meta` sidecars and C files of their FFI wrappers. Any `use X;` that the project doesn't satisfy itself resolves to the first `X.silica` under that folder.
+
+To use a Silica checkout instead, point `SILICA_STDLIB` at its `compiler/stdlib`. A `~/.silica/stdlib` that the CLI did not install (one without `~/.silica/stdlib.release`) is never replaced.
+
+### FFI wrappers
+
+A `dangerous_*` module names its Fifi sidecar with `wrapper_meta "dangerous_exposure_source/..."`. Every `link_library` the sidecar declares needs a prebuilt archive at `dangerous_exposure_source/lib/lib<name>.a`. The build folder gets both:
+
+- the project's own `dangerous_exposure_source/`, mirrored file by file;
+- any sidecar the project doesn't provide, found by file name under the library folder. The standard library's socket wrappers (`dangerous_sockets`, used by the `(:tcp)`, `(:udp)` and `(:serial)` carriers) come from here;
+- any missing archive, compiled from `<name>.c` beside its sidecar into the build folder, never into your sources.
+
+So `silica run` works for a program that uses the standard library's carriers, with nothing to set up.
 
 ## What a build does
 
@@ -132,6 +145,8 @@ A build runs the same three stages as the Silica repository's [project Makefiles
 1. **Compile.** `<project>/.silica-build/<name>/` mirrors the sources through symlinks, so the compiler's `.sams` and `.iface` output never lands in your source tree. The modules are written to `silica.config` in `use`-dependency order with the entry last, and `silica-compiler` runs there. When the compiler exits 75 or 76 between units to reclaim memory, the CLI runs it again.
 2. **Assemble** each `.sams` file with `clang` on macOS or `cc` on Linux.
 3. **Link** with `main` as the entry point, plus any archives listed in `silica.link` by FFI wrappers.
+
+Before stage 1, the CLI builds any missing FFI wrapper archives; see [FFI wrappers](#ffi-wrappers).
 
 The compiler lives in `~/.silica/bin`. It is the `silica-<NNNNNN>-<platform>` asset from the [latest release](https://github.com/Silica-Language-and-Compiler/silica/releases/latest), and `silica-compiler` links to it. When a release has several, the CLI takes the lowest number, which is the newest compiler.
 
@@ -143,7 +158,9 @@ The language specification ships with each compiler release as `silica-specifica
 ~/.silica/
 ├── bin/          silica, silica-compiler -> silica-<NNNNNN>-<platform>
 ├── spec/         silica-specification.md, silica_ffi_wrapper_specification.md, ROADMAP.md, ...
-└── spec.release  the compiler release the specification came from
+├── spec.release  the compiler release the specification came from
+├── stdlib/       the standard library sources (compiler/stdlib at that release)
+└── stdlib.release
 ```
 
 `silica spec` prints plain-text instructions, written for AI coding agents, on using the specification. It gives the folder's absolute path, the documents to start with, and how to find a section from a compiler error (`spec:sect3.6.3` points to the heading `3.6.3`) or an error code (`E2008`). It also lists every document with its title. Point an agent at it, for example from `CLAUDE.md` or `AGENTS.md`:

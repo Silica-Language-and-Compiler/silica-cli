@@ -56,6 +56,55 @@ fn main() -> atom {
 }
 EOF
 
+# A program on the standard library's FFI wrappers: its sidecar and C archive come from the
+# library, not the project. The (:tcp) carrier binds a free loopback port and the program ends.
+mkdir -p "$work/ffi-stdlib"
+cat > "$work/ffi-stdlib/dangerous_listen.silica" <<'EOF'
+module dangerous_listen;
+
+use dangerous_tcp_carrier;
+
+fn region_dump_limit() -> int64 {
+    0
+}
+
+fn reporter(_report: string, state: { seen: int64 }) -> (:no_reply, { seen: int64 }) {
+    (:no_reply, { seen: state.seen + 1 })
+}
+
+fn owner(msg: (:link_up, string) | (:accepted, dangerous_actor_ref, string) | (:rx, string) | (:tx_credit, int64) | (:tx_failed, atom) | (:link_down, atom),
+         state: { up: int64 }) -> (:no_reply, { up: int64 }) {
+    case msg of {
+        (:link_up, _info: string) -> {
+            sequence proc[concurrency, device_io]
+                _: atom <- println("listening");
+                _: boolean <- cast_exit(0)
+            produces
+                pure (:no_reply, { up: state.up + 1 })
+            end
+        };
+        (:accepted, _conn: dangerous_actor_ref, _peer: string) -> (:no_reply, state);
+        (:rx, _bytes: string) -> (:no_reply, state);
+        (:tx_credit, _n: int64) -> (:no_reply, state);
+        (:tx_failed, _why: atom) -> (:no_reply, state);
+        (:link_down, _why2: atom) -> (:no_reply, state)
+    }
+}
+
+fn main() -> int64 {
+    sequence proc[concurrency, device_io]
+        rep: actor_ref <- spawn({ seen: 0 }, reporter, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: atom <- register_failure_reporter(rep);
+        car: dangerous_actor_ref <- spawn_dangerous({ owner: actor_ref_of_word(0), fd: 0 - 1, rx_credit: 0, up: false, listening: false, link_spec: "" }, dangerous_tcp_carrier@carrier, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        own: actor_ref <- spawn({ up: 0 }, owner, stack_policy(0, :keep_last_message), state_policy(:keep_state_area));
+        _: boolean <- cast(car, (:open, own, "listen:0") impl ActorMessage {});
+        code: int64 <- wait_for_exit()
+    produces
+        pure code
+    end
+}
+EOF
+
 echo "not a program" > "$work/notes.txt"
 
 mkdir -p "$work/no-entry"
@@ -77,6 +126,13 @@ expect "build with -o"                  0 ""              -- "$cli" build "$work
 expect "built executable runs"          2 "greetings"     -- "$work/out/greet"
 expect "compile error fails"            1 ""              -- "$cli" build "$work/broken"
 expect "folder without entry fails"     1 ""              -- "$cli" build "$work/no-entry"
+# The standard library is downloaded on demand when SILICA_STDLIB is not set.
+expect "run stdlib FFI program"         0 "listening"     -- "$cli" run "$work/ffi-stdlib"
+if [ -n "$(find "$work/ffi-stdlib" -not -path '*/.silica-build*' -name '*.a')" ]; then
+  fail "FFI archive stays in the build folder" "$(find "$work/ffi-stdlib" -not -path '*/.silica-build*' -name '*.a')"
+else
+  pass "FFI archive stays in the build folder"
+fi
 
 # `silica update` installs the specification flat into $SILICA_HOME/spec.
 spec_dir="${SILICA_HOME:-$HOME/.silica}/spec"
