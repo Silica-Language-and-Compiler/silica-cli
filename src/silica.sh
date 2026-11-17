@@ -36,9 +36,9 @@ if [ -z "${SILICA_STDLIB:-}" ] && [ -d "$SILICA_STDLIB_DIR" ]; then SILICA_STDLI
 # output helpers
 
 if [ -t 2 ]; then
-  c_red=$'\033[31m'; c_green=$'\033[32m'; c_dim=$'\033[2m'; c_bold=$'\033[1m'; c_off=$'\033[0m'
+  c_red=$'\033[31m'; c_green=$'\033[32m'; c_cyan=$'\033[36m'; c_dim=$'\033[2m'; c_bold=$'\033[1m'; c_off=$'\033[0m'
 else
-  c_red=; c_green=; c_dim=; c_bold=; c_off=
+  c_red=; c_green=; c_cyan=; c_dim=; c_bold=; c_off=
 fi
 
 die()  { printf '%serror:%s %s\n' "$c_red" "$c_off" "$*" >&2; exit 1; }
@@ -705,6 +705,63 @@ build_ffi_archives() { # build_ffi_archives <build_dir> <cc> [cflags...]
 # ---------------------------------------------------------------------------
 # build
 
+# Runs the compiler with its output appended to <log>, and meanwhile redraws one Cargo-style
+# progress line on the terminal from what the log says so far:
+#      Building [=========>               ] 3/10: dangerous_store
+# The compiler parses every unit, then compiles them one by one, logging each phase
+# ("  Type checking...") and "Finished compiling <unit>" at the end of each. The line is
+# erased when the compiler exits. Returns the compiler's exit status.
+# Arguments: <log> <unit count> <build dir> <compiler>
+COMPILE_PHASES=10  # phases the compiler logs per unit (Module checking … Emitting)
+run_with_progress() {
+  local log="$1" total="$2" dir="$3" compiler="$4"
+  local pid ec cols width=25
+  cols="$(tput cols 2>/dev/null || echo 80)"
+  (cd "$dir" && exec "$compiler") >> "$log" 2>&1 &
+  pid=$!
+  # A background job in a script ignores SIGINT, so pass Ctrl-C (and kills) on to it.
+  trap 'kill "$pid" 2>/dev/null; printf "\r\033[K" >&2; exit 130' INT TERM
+
+  local frame=0 spin='|/-\'
+  while kill -0 "$pid" 2>/dev/null; do
+    local done phase parsing unit
+    read -r done phase parsing unit < <(awk '
+      /^Finished compiling /   { done++; phase = 0; next }
+      /^Parsing *$/            { state = "p"; next }
+      /^Compiling *$/          { state = "c"; phase = 0; next }
+      /\.silica\.\.\.$/        { unit = $0; sub(/\.silica\.\.\.$/, "", unit); sub(/.*\//, "", unit); next }
+      /^  [A-Za-z].*\.\.\.$/   { if (state == "c") phase++; next }
+      END { printf "%d %d %d %s\n", done, phase, (state != "c"), unit }' "$log" 2>/dev/null)
+    : "${done:=0}" "${phase:=0}" "${parsing:=1}"
+    [ "$done" -le "$total" ] || done="$total"
+    [ "$phase" -lt "$COMPILE_PHASES" ] || phase=$((COMPILE_PHASES - 1))
+
+    # Filled cells: finished units plus the share of the current one.
+    local filled=$(( (done * COMPILE_PHASES + phase) * width / (total * COMPILE_PHASES) ))
+    [ "$filled" -le "$width" ] || filled="$width"
+    local bar="" i=0
+    while [ "$i" -lt "$width" ]; do
+      if [ "$i" -lt "$filled" ]; then bar="$bar="
+      elif [ "$i" -eq "$filled" ]; then bar="$bar>"
+      else bar="$bar "; fi
+      i=$((i + 1))
+    done
+    local what="${unit:-}"
+    [ "$parsing" = 1 ] && what="parsing${unit:+ $unit}"
+    local line
+    line="$(printf '[%s] %d/%d %s: %s' "$bar" "$done" "$total" "${spin:$((frame % 4)):1}" "$what")"
+    # Keep it to one terminal row so \r can redraw it.
+    line="${line:0:$((cols > 14 ? cols - 14 : 1))}"
+    printf '\r\033[K%s%12s%s %s' "$c_bold$c_cyan" Building "$c_off" "$line" >&2
+    frame=$((frame + 1))
+    sleep 0.1
+  done
+  wait "$pid"; ec=$?
+  trap - INT TERM
+  printf '\r\033[K' >&2
+  return "$ec"
+}
+
 # Sets BUILT_EXE to the linked executable. Arguments: <path> <output-or-empty> <verbose 0|1>
 build_project() {
   local target="$1" output="$2" verbose="$3"
@@ -864,6 +921,8 @@ $(printf '  %s\n' $candidates)" ;;
   while true; do
     if [ "$verbose" = 1 ]; then
       (cd "$build_dir" && "$compiler") 2>&1 | tee -a "$log" >&2; ec="${PIPESTATUS[0]}"
+    elif [ -t 2 ]; then
+      run_with_progress "$log" "$count" "$build_dir" "$compiler"; ec=$?
     else
       (cd "$build_dir" && "$compiler") >> "$log" 2>&1; ec=$?
     fi
