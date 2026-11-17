@@ -724,20 +724,20 @@ run_with_progress() {
 
   local frame=0 spin='|/-\'
   while kill -0 "$pid" 2>/dev/null; do
-    local done phase parsing unit
-    read -r done phase parsing unit < <(awk '
+    local ndone phase parsing unit
+    read -r ndone phase parsing unit < <(awk '
       /^Finished compiling /   { done++; phase = 0; next }
       /^Parsing *$/            { state = "p"; next }
       /^Compiling *$/          { state = "c"; phase = 0; next }
       /\.silica\.\.\.$/        { unit = $0; sub(/\.silica\.\.\.$/, "", unit); sub(/.*\//, "", unit); next }
       /^  [A-Za-z].*\.\.\.$/   { if (state == "c") phase++; next }
       END { printf "%d %d %d %s\n", done, phase, (state != "c"), unit }' "$log" 2>/dev/null)
-    : "${done:=0}" "${phase:=0}" "${parsing:=1}"
-    [ "$done" -le "$total" ] || done="$total"
+    : "${ndone:=0}" "${phase:=0}" "${parsing:=1}"
+    [ "$ndone" -le "$total" ] || ndone="$total"
     [ "$phase" -lt "$COMPILE_PHASES" ] || phase=$((COMPILE_PHASES - 1))
 
     # Filled cells: finished units plus the share of the current one.
-    local filled=$(( (done * COMPILE_PHASES + phase) * width / (total * COMPILE_PHASES) ))
+    local filled=$(( (ndone * COMPILE_PHASES + phase) * width / (total * COMPILE_PHASES) ))
     [ "$filled" -le "$width" ] || filled="$width"
     local bar="" i=0
     while [ "$i" -lt "$width" ]; do
@@ -749,7 +749,7 @@ run_with_progress() {
     local what="${unit:-}"
     [ "$parsing" = 1 ] && what="parsing${unit:+ $unit}"
     local line
-    line="$(printf '[%s] %d/%d %s: %s' "$bar" "$done" "$total" "${spin:$((frame % 4)):1}" "$what")"
+    line="$(printf '[%s] %d/%d %s: %s' "$bar" "$ndone" "$total" "${spin:$((frame % 4)):1}" "$what")"
     # Keep it to one terminal row so \r can redraw it.
     line="${line:0:$((cols > 14 ? cols - 14 : 1))}"
     printf '\r\033[K%s%12s%s %s' "$c_bold$c_cyan" Building "$c_off" "$line" >&2
