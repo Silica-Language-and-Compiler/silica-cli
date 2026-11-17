@@ -143,6 +143,43 @@ else
   pass "FFI archive stays in the build folder"
 fi
 
+# An unchanged project reuses its last program; any change, or --rebuild, compiles again.
+# expect_step <name> <step word> <wanted 0|1>: whether the last command's stderr showed that step.
+expect_step() {
+  if grep -qE "^ *$2 " "$work/stderr"; then got=1; else got=0; fi
+  if [ "$got" = "$3" ]; then pass "$1"; else fail "$1" "$(cat "$work/stderr")"; fi
+}
+expect "rerun unchanged folder"         2 "Hello, world!" -- "$cli" run "$work/hello-world"
+expect_step "unchanged folder is not recompiled" Compiling 0
+expect_step "unchanged folder reports Fresh"     Fresh     1
+expect "rerun stdlib FFI program"       0 "listening"     -- "$cli" run "$work/ffi-stdlib"
+expect_step "unchanged FFI program is not recompiled" Compiling 0
+expect "rerun with --rebuild"           2 "Hello, world!" -- "$cli" run "$work/hello-world" --rebuild
+expect_step "--rebuild recompiles"               Compiling 1
+cp "$work/hello-world/main.silica" "$work/hello-main.orig"
+sed 's/Hello, world!/Hello, again!/' "$work/hello-main.orig" > "$work/hello-world/main.silica"
+expect "run after an edit"              2 "Hello, again!" -- "$cli" run "$work/hello-world"
+expect_step "edited folder is recompiled"        Compiling 1
+# Assembly that comes out the same keeps its object; a kept FFI archive is not built again.
+printf '// a comment\n' >> "$work/hello-world/main.silica"
+expect "run after a comment-only edit"  2 "Hello, again!" -- "$cli" run "$work/hello-world"
+if grep -qE "Assembling hello-world \(0 of [0-9]+ changed\)" "$work/stderr"; then
+  pass "unchanged assembly is not assembled again"
+else
+  fail "unchanged assembly is not assembled again" "$(cat "$work/stderr")"
+fi
+printf '// a comment\n' >> "$work/ffi-stdlib/main.silica"
+expect "run FFI program after an edit"  0 "listening"     -- "$cli" run "$work/ffi-stdlib"
+expect_step "kept FFI archive is not rebuilt"    Building  0
+cp "$work/broken/"*.silica "$work/hello-world/main.silica"
+expect "edit that breaks the build"     1 ""              -- "$cli" run "$work/hello-world"
+cp "$work/hello-main.orig" "$work/hello-world/main.silica"
+expect "run after a failed build"       2 "Hello, world!" -- "$cli" run "$work/hello-world"
+expect_step "failed build is not reused"         Compiling 1
+rm "$work/hello-world/.silica-build/hello-world/hello-world"
+expect "run after the program is deleted" 2 "Hello, world!" -- "$cli" run "$work/hello-world"
+expect_step "deleted program is rebuilt"         Compiling 1
+
 # --host and --target. This machine's own target, by any spelling, is the default build.
 machine="$("$cli" version | sed -n 's/^platform: //p')"
 expect "run --target this machine"      2 "greetings"     -- "$cli" run "$work/single/greet.silica" --target "$machine"
