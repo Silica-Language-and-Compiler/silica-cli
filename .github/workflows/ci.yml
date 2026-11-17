@@ -123,7 +123,7 @@ jobs:
           tag="${{ steps.version.outputs.tag }}"
           stage="dist/silica-cli"
           mkdir -p "${stage}"
-          cp -R silica install.sh README.md src examples "${stage}/"
+          cp -R silica install.sh README.md src "${stage}/"
           sed -i "s/^SILICA_CLI_VERSION=\"dev\"\$/SILICA_CLI_VERSION=\"${tag}\"/" "${stage}/src/silica.sh"
           grep -q "^SILICA_CLI_VERSION=\"${tag}\"\$" "${stage}/src/silica.sh" \
             || { echo "could not stamp the version into src/silica.sh" >&2; exit 1; }
