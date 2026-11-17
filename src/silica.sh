@@ -3,6 +3,7 @@
 #
 #   silica build <file-or-folder>   compile, assemble and link an executable
 #   silica run   <file-or-folder>   build, then execute it
+#   silica sildat <in> <out>        pack a text file into a Silica store backing
 #   silica update                   update every installed compiler, the specification and stdlib
 #   silica spec [--path]            where the specification is and how to read it (for AI)
 #   silica version                  show which compiler is in use
@@ -58,6 +59,11 @@ Commands:
                   specification (Markdown) into ~/.silica/spec and the standard
                   library sources into ~/.silica/stdlib. --target/--host also
                   install that compiler.
+  sildat <in> <out>
+                  Pack <in> into a Silica store backing at <out>: one record per
+                  non-empty line, the line as a string. --capacity must match the
+                  program's (:backing) link (default: the smallest multiple of 4096
+                  that holds the lines). Needs python3.
   spec            Explain where the language specification is and how to use it
                   (written for AI agents; --path prints just the folder)
   version         Print the compiler in use and the release it came from
@@ -88,6 +94,7 @@ Examples:
   silica run my_app -- --some-arg
   silica build my_app --target linux-aarch64
   silica build my_app --target ESP32_S3_raw
+  silica sildat app.log app.sildat --capacity 1048576
 EOF
 }
 
@@ -1337,6 +1344,191 @@ cmd_version() {
   echo "platform: $(host_platform)"
 }
 
+# `silica sildat [--capacity BYTES] [--schema N] <in-file> <out-file>`
+#
+# Writes the on-medium form of a (:store) (:backing) (transport_serialization_design.md
+# §6.8.3, §6.8.4, storelog.silica): 4096-byte blocks, a 16-byte header, then records of
+# {length, seq, crc32c, payload}. Each non-empty line is one record whose payload is one
+# :storage frame: format id 1 (:etf), a schema version, and the ETF encoding of the line
+# as a byte string. The file is exactly --capacity bytes, because the carrier refuses a
+# backing of any other size. python3 does the packing; the CLI has no other use for it.
+cmd_sildat() {
+  local capacity="" schema="1" in="" out=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --capacity)
+        [ $# -ge 2 ] || die "--capacity needs a size in bytes (a multiple of 4096)"
+        capacity="$2"; shift 2 ;;
+      --capacity=*) capacity="${1#--capacity=}"; shift ;;
+      --schema)
+        [ $# -ge 2 ] || die "--schema needs a version from 0 to 65535"
+        schema="$2"; shift 2 ;;
+      --schema=*) schema="${1#--schema=}"; shift ;;
+      -h|--help)
+        cat <<'EOF'
+Usage: silica sildat [--capacity BYTES] [--schema N] <in-file> <out-file>
+
+Pack a text file into a Silica store backing. Each non-empty line becomes one
+record: the line as a Silica string, ETF-encoded, under schema version N
+(default 1). Blank lines are skipped.
+
+--capacity is the file size in bytes. It must be a positive multiple of 4096
+and the same number as the capacity in the program's link:
+
+    carried_on log: (:store) (:backing, "app.sildat", 1048576, :stop);
+
+Without --capacity, the file is the smallest multiple of 4096 that holds the
+lines, and the size is printed so it can be copied into that link. A line
+longer than 4051 bytes does not fit in one record.
+
+The output is replaced. This command needs python3.
+EOF
+        return 0 ;;
+      -*) die "unknown option: $1 (see: silica sildat --help)" ;;
+      *)
+        if [ -z "$in" ]; then in="$1"
+        elif [ -z "$out" ]; then out="$1"
+        else die "unexpected argument: $1"
+        fi
+        shift ;;
+    esac
+  done
+  [ -n "$in" ] && [ -n "$out" ] || die "silica sildat needs an input file and an output file (see: silica sildat --help)"
+  [ -f "$in" ] || die "no such file: $in"
+  [ "$in" != "$out" ] || die "input and output are the same file"
+  command -v python3 >/dev/null 2>&1 || die "silica sildat needs python3"
+  case "$out" in
+    *.sildat) ;;
+    *) warn "store backings are named *.sildat by convention" ;;
+  esac
+
+  python3 - "$in" "$out" "$capacity" "$schema" <<'PY' || exit $?
+import os
+import struct
+import sys
+import tempfile
+
+BLOCK = 4096
+HEADER = 16
+ENVELOPE = 16
+# One :storage segment: frame_seq u16, index u16, format id, schema u16,
+# ETF BINARY_EXT (131, 109), byte length u32, then the line.
+MAX_LINE = BLOCK - HEADER - ENVELOPE - 13
+ETF_FORMAT_ID = 1
+
+in_path, out_path, capacity_s, schema_s = sys.argv[1:5]
+
+
+def fail(msg):
+    sys.stderr.write("error: %s\n" % msg)
+    sys.exit(1)
+
+
+def crc32c_table():
+    table = []
+    for n in range(256):
+        c = n
+        for _ in range(8):
+            c = (c >> 1) ^ 0x82F63B78 if c & 1 else c >> 1
+        table.append(c)
+    return table
+
+
+CRC_TABLE = crc32c_table()
+
+
+def crc32c(data):
+    c = 0xFFFFFFFF
+    t = CRC_TABLE
+    for b in data:
+        c = t[(c ^ b) & 0xFF] ^ (c >> 8)
+    return c ^ 0xFFFFFFFF
+
+
+def block_header(first_seq):
+    body = struct.pack(">QI", first_seq, 1)
+    return body + struct.pack(">I", crc32c(body))
+
+
+def envelope(seq, payload):
+    head = struct.pack(">IQ", len(payload), seq)
+    return head + struct.pack(">I", crc32c(head + payload)) + payload
+
+
+def stored_line(line, schema):
+    value = bytes([131, 109]) + struct.pack(">I", len(line)) + line
+    record = bytes([ETF_FORMAT_ID]) + struct.pack(">H", schema) + value
+    # wireframe :storage, one segment: index 0 with the last-segment bit set.
+    return struct.pack(">HH", 0, 0x8000) + record
+
+
+try:
+    schema = int(schema_s)
+except ValueError:
+    fail("--schema needs a version from 0 to 65535")
+if schema < 0 or schema > 65535:
+    fail("--schema needs a version from 0 to 65535")
+
+if capacity_s == "":
+    capacity = None
+else:
+    try:
+        capacity = int(capacity_s)
+    except ValueError:
+        fail("--capacity needs a size in bytes (a multiple of 4096)")
+    if capacity <= 0 or capacity % BLOCK != 0:
+        fail("--capacity must be a positive multiple of 4096")
+
+parent = os.path.dirname(out_path)
+if parent and not os.path.isdir(parent):
+    fail("no such directory: %s" % parent)
+if os.path.realpath(in_path) == os.path.realpath(out_path):
+    fail("input and output are the same file")
+
+tmp = None
+try:
+    fd, tmp = tempfile.mkstemp(prefix=".sildat-", dir=parent or ".")
+    os.close(fd)
+    block, pos, seq = 0, 0, 0
+    with open(in_path, "rb") as src, open(tmp, "r+b") as dst:
+        for lineno, raw in enumerate(src, 1):
+            line = raw.rstrip(b"\r\n")
+            if not line.strip():
+                continue
+            if len(line) > MAX_LINE:
+                fail("line %d is %d bytes; a stored line can be at most %d bytes" % (lineno, len(line), MAX_LINE))
+            rec = envelope(seq, stored_line(line, schema))
+            if pos == 0 or pos + len(rec) > BLOCK:
+                if pos != 0:
+                    block += 1
+                if capacity is not None and (block + 1) * BLOCK > capacity:
+                    fail("%s does not fit in %d bytes" % (in_path, capacity))
+                dst.seek(block * BLOCK)
+                dst.write(block_header(seq))
+                pos = HEADER
+            dst.seek(block * BLOCK + pos)
+            dst.write(rec)
+            pos += len(rec)
+            seq += 1
+        if capacity is None:
+            capacity = BLOCK if seq == 0 else (block + 1) * BLOCK
+        dst.truncate(capacity)
+    os.replace(tmp, out_path)
+    tmp = None
+    mask = os.umask(0)
+    os.umask(mask)
+    os.chmod(out_path, 0o666 & ~mask)
+finally:
+    if tmp and os.path.exists(tmp):
+        os.remove(tmp)
+
+blocks = 0 if seq == 0 else block + 1
+line_unit = "line" if seq == 1 else "lines"
+block_unit = "block" if blocks == 1 else "blocks"
+sys.stdout.write("wrote %d %s in %d %s to %s (capacity %d)\n" % (seq, line_unit, blocks, block_unit, out_path, capacity))
+PY
+}
+
 # `silica update [--host <platform>] [--target <target>]`
 cmd_update() {
   local host_opt="" target_opt=""
@@ -1363,6 +1555,7 @@ main() {
   local cmd="$1"; shift
   case "$cmd" in
     build|run)           cmd_build_or_run "$cmd" "$@" ;;
+    sildat)              cmd_sildat "$@" ;;
     update)              cmd_update "$@" ;;
     spec)                cmd_spec "$@" ;;
     version|--version)   cmd_version ;;

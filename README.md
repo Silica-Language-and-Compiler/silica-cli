@@ -29,7 +29,7 @@ Hello, world!
 ```
 
 - [Install](#install) on macOS (Apple Silicon), Linux on AArch64, or Linux on x86-64
-- [Commands](#commands): `build`, `run`, `update`, `version`
+- [Commands](#commands): `build`, `run`, `sildat`, `update`, `version`
 - [Hosts and targets](#hosts-and-targets): `--host` and `--target`
 - [What a build does](#what-a-build-does)
 - [The specification](#the-specification), installed to `~/.silica/spec`; `silica spec` explains it to AI agents
@@ -87,6 +87,7 @@ silica run my_app/               # a project folder; main.silica is the entry po
 silica run my_app -- arg1 arg2   # arguments after -- go to the program
 silica build my_app -o bin/app   # choose where the executable goes
 silica build my_app --target linux-aarch64   # generate code for another platform or a board
+silica sildat app.log app.sildat --capacity 1048576   # pack a text file into a store backing
 silica update                    # update every installed compiler, the specification and stdlib
 silica spec                      # where the specification is and how to use it (for AI agents)
 silica version                   # CLI version, compiler in use, platform
@@ -116,6 +117,22 @@ error: compilation failed (exit 1); full log: .silica-build/broken/compile.log
 - **A folder:** every `.silica` file under it. The entry point is `main.silica`, or the single top-level file that defines `fn main`.
 
 **Exit status.** `silica run` exits with the program's own status. A Silica `main` that returns an atom exits with that atom's index, so `:ok` is **2**, not 0.
+
+### `silica sildat`
+
+A Silica program cannot open a text file. It reads bytes through a `(:store)` carrier whose `(:backing, path, capacity, retention)` link names a host file ending in `.sildat`: an append-only log of checked records, not the text itself. `silica sildat` writes that log.
+
+```bash
+silica sildat app.log app.sildat --capacity 1048576
+```
+
+Each non-empty line becomes one record, the line as a Silica `string` (ETF, schema version 1). Blank lines are skipped. `--capacity` is the file's size in bytes, a multiple of 4096, and it has to be the same number as the capacity in the program:
+
+```silica
+carried_on log: (:store) (:backing, "app.sildat", 1048576, :stop);
+```
+
+The carrier refuses a backing of any other size. Without `--capacity`, the file is the smallest multiple of 4096 that holds the lines, and the command prints that size. `--schema N` stores the lines under another schema version (0 to 65535). A line longer than 4051 bytes does not fit in one record. This command needs `python3`. The output file is replaced.
 
 | Variable | Effect |
 | -------- | ------ |

@@ -124,6 +124,57 @@ printf 'fn helper() -> atom {\n    :ok\n}\n' > "$work/no-entry/helper.silica"
 expect "version"                        0 "" -- "$cli" version
 expect "help"                           0 "" -- "$cli" help
 expect "unknown command fails"          1 "" -- "$cli" frobnicate
+
+# Pack a text file into a store backing. Checked here, without a compiler: the
+# on-medium form is the one storelog.silica reads (4096-byte blocks, CRC-32C).
+printf 'alpha\n\nbeta \r\n  \n' > "$work/lines.txt"
+expect "sildat packs lines" 0 "wrote 2 lines in 1 block to $work/lines.sildat (capacity 4096)" \
+  -- "$cli" sildat "$work/lines.txt" "$work/lines.sildat"
+python3 - "$work/lines.sildat" <<'PY'
+import struct, sys
+path = sys.argv[1]
+data = open(path, "rb").read()
+assert len(data) == 4096, len(data)
+
+def crc32c(buf):
+    c = 0xFFFFFFFF
+    for b in buf:
+        c ^= b
+        for _ in range(8):
+            c = (c >> 1) ^ 0x82F63B78 if c & 1 else c >> 1
+    return c ^ 0xFFFFFFFF
+
+body = data[:12]
+assert struct.unpack(">QI", body) == (0, 1), struct.unpack(">QI", body)
+assert struct.unpack(">I", data[12:16])[0] == crc32c(body)
+# record 0: length, seq 0, crc, then one :storage frame of the ETF string "alpha"
+length, seq = struct.unpack(">IQ", data[16:28])
+payload = data[32:32 + length]
+assert seq == 0 and crc32c(data[16:28] + payload) == struct.unpack(">I", data[28:32])[0]
+assert payload[:4] == b"\x00\x00\x80\x00"          # frame_seq 0, index 0 | last
+assert payload[4:7] == b"\x01\x00\x01"              # :etf, schema 1
+assert payload[7:9] == bytes([131, 109])            # ETF BINARY_EXT
+assert struct.unpack(">I", payload[9:13])[0] == 5 and payload[13:18] == b"alpha"
+# The next record is "beta " with its trailing space kept, and the blank lines gone.
+nxt = 32 + length
+nlen, nseq = struct.unpack(">IQ", data[nxt:nxt + 12])
+npayload = data[nxt + 16:nxt + 16 + nlen]
+assert nseq == 1 and crc32c(data[nxt:nxt + 12] + npayload) == struct.unpack(">I", data[nxt + 12:nxt + 16])[0]
+assert npayload[13:] == b"beta "
+assert data[nxt + 16 + nlen:].strip(b"\x00") == b""
+PY
+if [ $? -eq 0 ]; then pass "sildat backing layout"; else fail "sildat backing layout" "header, crc or payload mismatch"; fi
+
+expect "sildat needs two paths" 1 "" -- "$cli" sildat "$work/lines.txt"
+"$cli" sildat --capacity 1000 "$work/lines.txt" "$work/bad.sildat" >/dev/null 2>"$work/stderr"
+if [ $? -eq 1 ] && grep -q "multiple of 4096" "$work/stderr"; then pass "sildat rejects a bad capacity"; else fail "sildat rejects a bad capacity" "$(cat "$work/stderr")"; fi
+# Each short record is 34 bytes. 200 of them need a second block.
+python3 -c 'open("'"$work"'/many.txt","wb").write(b"x\n"*200)'
+"$cli" sildat --capacity 4096 "$work/many.txt" "$work/many.sildat" >/dev/null 2>"$work/stderr"
+if [ $? -eq 1 ] && grep -q "does not fit" "$work/stderr"; then pass "sildat rejects an undersized capacity"; else fail "sildat rejects an undersized capacity" "$(cat "$work/stderr")"; fi
+python3 -c 'open("'"$work"'/long.txt","wb").write(b"a"*4052 + b"\n")'
+"$cli" sildat "$work/long.txt" "$work/long.sildat" >/dev/null 2>"$work/stderr"
+if [ $? -eq 1 ] && grep -q "at most 4051" "$work/stderr"; then pass "sildat rejects a long line"; else fail "sildat rejects a long line" "$(cat "$work/stderr")"; fi
 expect "run without a path fails"       1 "" -- "$cli" run
 expect "missing path fails"             1 "" -- "$cli" build "$work/does-not-exist"
 expect "non-.silica file fails"         1 "" -- "$cli" build "$work/notes.txt"
