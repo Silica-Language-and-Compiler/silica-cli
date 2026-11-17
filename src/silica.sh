@@ -67,6 +67,8 @@ Options for build and run:
   -o, --output <file>   Where to write the executable
                         (default: <project>/.silica-build/<name>/<name>)
   -v, --verbose         Show the compiler's full output
+  --rebuild             Build from an empty build folder (by default a build reuses
+                        what the last one made that is still up to date)
   --target <target>     Generate code for <target>: a platform (macos-applesilicon,
                         linux-aarch64, linux-x86_64) or a board (ESP32_S3_raw).
                         Default: this machine. A missing compiler is downloaded.
@@ -658,6 +660,7 @@ link_ffi_sidecars() { # link_ffi_sidecars <root> <build_dir>
   if [ -d "$root/dangerous_exposure_source" ]; then
     while IFS= read -r f; do
       mkdir -p "$build_dir/dangerous_exposure_source/$(dirname "$f")"
+      rm -f "$build_dir/dangerous_exposure_source/$f"  # an archive an earlier build made
       ln -s "$root/dangerous_exposure_source/$f" "$build_dir/dangerous_exposure_source/$f"
     done < <(cd "$root/dangerous_exposure_source" && find . \( -type f -o -type l \) | sed 's|^\./||')
   fi
@@ -678,6 +681,7 @@ link_ffi_sidecars() { # link_ffi_sidecars <root> <build_dir>
 # `link_library: "<name>"` a sidecar declares (FFI wrapper specification, silica.link). One the
 # project ships is used as it is; a missing one is built from <name>.c beside the sidecar, which is
 # how the standard library keeps its C wrappers. With no such source the compiler reports E4034.
+# An archive an earlier build made is kept until its C source changes.
 build_ffi_archives() { # build_ffi_archives <build_dir> <cc> [cflags...]
   local build_dir="$1" cc="$2" meta real name archive src
   shift 2
@@ -690,9 +694,10 @@ build_ffi_archives() { # build_ffi_archives <build_dir> <cc> [cflags...]
     fi
     while IFS= read -r name; do
       archive="$build_dir/dangerous_exposure_source/lib/lib$name.a"
-      [ -f "$archive" ] && continue
+      [ -L "$archive" ] && continue  # the project ships it
       src="$(dirname "$real")/$name.c"
       [ -f "$src" ] || continue
+      [ -f "$archive" ] && ! [ "$src" -nt "$archive" ] && continue
       command -v ar >/dev/null 2>&1 || die "ar is required to build lib$name.a"
       step Building "lib$name.a"
       mkdir -p "$build_dir/.ffi" "$(dirname "$archive")"
@@ -700,6 +705,97 @@ build_ffi_archives() { # build_ffi_archives <build_dir> <cc> [cflags...]
       ar rcs "$archive" "$build_dir/.ffi/$name.o" || die "creating lib$name.a failed"
     done < <(sed -n 's/^[[:space:]]*link_library:[[:space:]]*"\([^"]*\)".*/\1/p' "$meta")
   done < <(find -L "$build_dir/dangerous_exposure_source" -name '*.meta' 2>/dev/null | LC_ALL=C sort)
+}
+
+# SHA-256 of the files named (or of stdin), in sha256sum's "<hash>  <file>" format.
+if command -v sha256sum >/dev/null 2>&1; then SHA256=(sha256sum); else SHA256=(shasum -a 256); fi
+
+# One hash of the tools a build uses: the compiler, this script and the settings given. What a
+# build folder holds (objects, FFI archives) is only reused by a build with the same toolchain.
+toolchain_key() { # toolchain_key <compiler> [setting...]
+  local compiler="$1"
+  shift
+  { printf 'setting %s\n' "$@"; "${SHA256[@]}" "$compiler" "${BASH_SOURCE[0]}" | cut -d' ' -f1; } \
+    | "${SHA256[@]}" | cut -d' ' -f1
+}
+
+# One hash of everything a build's output depends on: the toolchain key and the content of every
+# input linked into the build folder (the project's modules, the library modules and FFI sidecars),
+# plus the C sources of library FFI archives. A build whose fingerprint matches the last one's
+# would produce the same program.
+build_fingerprint() { # build_fingerprint <build_dir> <toolchain key> [setting...]
+  local dir="$1"
+  shift
+  {
+    printf 'setting %s\n' "$@"
+    cat "$dir/.units"
+    (cd "$dir" && find . -type l -print0 | LC_ALL=C sort -z | xargs -0 "${SHA256[@]}")
+    # Library sidecars are links into SILICA_STDLIB; their archives build from .c files there.
+    find "$dir" -type l -name '*.meta' -exec readlink {} \; | while IFS= read -r meta; do
+      find "$(dirname "$meta")" -maxdepth 1 -type f -name '*.c'
+    done | LC_ALL=C sort -u | while IFS= read -r src; do "${SHA256[@]}" "$src"; done
+  } | "${SHA256[@]}" | cut -d' ' -f1
+}
+
+# Decides which units keep the .sams/.iface of an earlier build, and lists them in
+# silica.up_to_date, where the compiler skips them. Run in the build folder after silica.config
+# is written. .unit_hashes holds the SHA-256 of each unit's source as the last successful build
+# compiled it, and one of the FFI sidecars. A unit is up to date when its source hash is
+# unchanged, its .sams is there, and every unit it `use`s is up to date too, so a change reaches
+# all the units that depend on it, directly or not. A changed sidecar makes no unit up to date.
+# Writes .unit_hashes.next, which becomes .unit_hashes once the compile succeeds; until then
+# .unit_hashes keeps only the units that are not being compiled again.
+plan_incremental() {
+  local f
+  # Output of units that are no longer part of the build.
+  while IFS= read -r f; do
+    [ -e "${f%.*}.silica" ] || rm -f "$f" "${f%.*}.o"
+  done < <(find . -type f \( -name '*.sams' -o -name '*.iface' \) ! -name '__silica_runtime.sams' | sed 's|^\./||')
+  {
+    tr '\n' '\0' < silica.config | xargs -0 "${SHA256[@]}"
+    if [ -d dangerous_exposure_source ]; then
+      printf '%s  /sidecars\n' "$(find dangerous_exposure_source -type l -print0 | LC_ALL=C sort -z \
+        | xargs -0 "${SHA256[@]}" | "${SHA256[@]}" | cut -d' ' -f1)"
+    fi
+  } > .unit_hashes.next
+  find . -type f -name '*.sams' | sed 's|^\./||' > .sams_present
+  touch .unit_hashes
+  awk -v prev_file=.unit_hashes -v cur_file=.unit_hashes.next -v sams_file=.sams_present -v record=.unit_hashes.kept '
+    function modname(p, b) { b = p; sub(/^.*\//, "", b); sub(/\.silica$/, "", b); return b }
+    function trim(s) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); return s }
+    function load(file, arr,   l, h) {
+      while ((getline l < file) > 0) { h = l; sub(/ .*/, "", h); sub(/^[^ ]* \*? ?/, "", l); arr[l] = h }
+      close(file)
+    }
+    BEGIN {
+      load(prev_file, prev); load(cur_file, cur)
+      while ((getline l < sams_file) > 0) has_sams[l] = 1
+      close(sams_file)
+      sidecars_same = (("/sidecars" in prev) == ("/sidecars" in cur)) && prev["/sidecars"] == cur["/sidecars"]
+    }
+    NF { paths[++n] = $0; mod_path[modname($0)] = $0 }
+    END {
+      printf "" > record
+      if (sidecars_same && ("/sidecars" in cur)) printf "%s  /sidecars\n", cur["/sidecars"] > record
+      for (i = 1; i <= n; i++) {
+        p = paths[i]; s = p; sub(/\.silica$/, ".sams", s)
+        ok = sidecars_same && (p in prev) && prev[p] == cur[p] && (s in has_sams)
+        while (ok && (getline line < p) > 0) {
+          if (line !~ /^[[:space:]]*use[[:space:]]+/) continue
+          sub(/^[[:space:]]*use[[:space:]]+/, "", line); sub(/;.*$/, "", line)
+          nd = split(line, deps, /,/)
+          for (d = 1; d <= nd; d++) {
+            dep = trim(deps[d])
+            if (dep in mod_path && mod_path[dep] != p && !(mod_path[dep] in fresh)) ok = 0
+          }
+        }
+        close(p)
+        if (ok) { fresh[p] = 1; print p; printf "%s  %s\n", cur[p], p > record }
+      }
+    }' silica.config > silica.up_to_date || return 1
+  mv .unit_hashes.kept .unit_hashes
+  rm -f .sams_present
+  [ -s silica.up_to_date ] || rm -f silica.up_to_date
 }
 
 # ---------------------------------------------------------------------------
@@ -763,8 +859,11 @@ run_with_progress() {
 }
 
 # Sets BUILT_EXE to the linked executable. Arguments: <path> <output-or-empty> <verbose 0|1>
+# <rebuild 0|1>. The build folder persists between builds: a build whose inputs match the last
+# one's (see build_fingerprint) reuses its program, and otherwise only the assembly that changed
+# is assembled again. <rebuild> 1 starts from an empty build folder.
 build_project() {
-  local target="$1" output="$2" verbose="$3"
+  local target="$1" output="$2" verbose="$3" rebuild="${4:-0}"
   local root entry name build_dir
 
   [ -e "$target" ] || die "no such file or folder: $target"
@@ -809,10 +908,61 @@ $(printf '  %s\n' $candidates)" ;;
   local compiler platform="$SEL_TARGET_PLATFORM"
   compiler="$(resolve_compiler)" || exit 1
 
-  # A fresh build directory that mirrors the project through symlinks. The compiler writes
-  # .sams/.iface beside each path it reads, so the source tree itself stays untouched.
-  rm -rf "$build_dir"
+  # The C toolchain for the target: it builds any missing FFI archive now, and assembles and
+  # links later. A target other than this machine needs a cross toolchain: CC, or the usual
+  # GNU cross compiler for it. A board has no toolchain here; its build stops at assembly.
+  local cc asflags ldflags cflags
+  cc="${CC:-}"
+  if [ -n "$platform" ] && [ "$platform" != "$machine" ] && [ -z "$cc" ]; then
+    local candidate
+    case "$platform" in
+      linux-aarch64) candidate=aarch64-linux-gnu-gcc ;;
+      linux-x86_64)  candidate=x86_64-linux-gnu-gcc ;;
+      *)             candidate= ;;
+    esac
+    if [ -n "$candidate" ] && command -v "$candidate" >/dev/null 2>&1; then
+      cc="$candidate"
+    else
+      die "building for $platform on $machine needs a C toolchain that targets $platform to assemble and link; set CC${candidate:+ (for example CC=$candidate)}"
+    fi
+  fi
+  case "$platform" in
+    macos-*)
+      [ -n "$cc" ] || cc=clang
+      asflags=(-mmacosx-version-min="${MACOS_MIN_VERSION:-26.0}")
+      cflags=("${asflags[@]}")
+      # Entry symbol is `main`; deep recursion wants a larger main-thread stack.
+      # shellcheck disable=SC2054  # the commas belong to -Wl, they do not separate elements
+      ldflags=(-Wl,-e,main -Wl,-stack_size,0x10000000) ;;
+    linux-*)
+      [ -n "$cc" ] || cc=cc
+      asflags=()
+      cflags=(-D_GNU_SOURCE)
+      # crt1.o calls main; data tables hold absolute addresses (-no-pie); the failure banner
+      # resolves behavior names through dladdr (-rdynamic).
+      ldflags=(-no-pie -rdynamic -lpthread) ;;
+    '')
+      asflags=(); cflags=(); ldflags=() ;;
+  esac
+  if [ -n "$platform" ]; then
+    command -v "$cc" >/dev/null 2>&1 || die "$cc is required to assemble and link Silica programs"
+  fi
+
+  # The build directory mirrors the project through symlinks. The compiler writes .sams/.iface
+  # beside each path it reads, so the source tree itself stays untouched. The folder persists
+  # between builds so its objects and FFI archives can be reused; a different toolchain (or
+  # --rebuild) empties it first. The mirror itself is made afresh every time.
+  local toolchain
+  toolchain="$(toolchain_key "$compiler" "target=$SEL_TARGET" "platform=$platform" "cc=$cc" \
+    "asflags=${asflags[*]-}" "cflags=${cflags[*]-}" "ldflags=${ldflags[*]-}")" \
+    || die "could not fingerprint the toolchain"
+  rm -rf "$build_dir.staging"  # left by an earlier version of this script
+  if [ "$rebuild" = 1 ] || [ "$(cat "$build_dir/.toolchain" 2>/dev/null)" != "$toolchain" ]; then
+    rm -rf "$build_dir"
+  fi
   mkdir -p "$build_dir" || die "cannot create $build_dir"
+  printf '%s\n' "$toolchain" > "$build_dir/.toolchain"
+  find "$build_dir" -type l -exec rm -f {} + 2>/dev/null
 
   local units_file="$build_dir/.units"
   if [ -d "$target" ]; then
@@ -864,55 +1014,40 @@ $(printf '  %s\n' $candidates)" ;;
     done
   fi
 
-  # The C toolchain for the target: it builds any missing FFI archive now, and assembles and
-  # links later. A target other than this machine needs a cross toolchain: CC, or the usual
-  # GNU cross compiler for it. A board has no toolchain here; its build stops at assembly.
-  local cc asflags ldflags cflags
-  cc="${CC:-}"
-  if [ -n "$platform" ] && [ "$platform" != "$machine" ] && [ -z "$cc" ]; then
-    local candidate
-    case "$platform" in
-      linux-aarch64) candidate=aarch64-linux-gnu-gcc ;;
-      linux-x86_64)  candidate=x86_64-linux-gnu-gcc ;;
-      *)             candidate= ;;
-    esac
-    if [ -n "$candidate" ] && command -v "$candidate" >/dev/null 2>&1; then
-      cc="$candidate"
-    else
-      die "building for $platform on $machine needs a C toolchain that targets $platform to assemble and link; set CC${candidate:+ (for example CC=$candidate)}"
-    fi
-  fi
-  case "$platform" in
-    macos-*)
-      [ -n "$cc" ] || cc=clang
-      asflags=(-mmacosx-version-min="${MACOS_MIN_VERSION:-26.0}")
-      cflags=("${asflags[@]}")
-      # Entry symbol is `main`; deep recursion wants a larger main-thread stack.
-      # shellcheck disable=SC2054  # the commas belong to -Wl, they do not separate elements
-      ldflags=(-Wl,-e,main -Wl,-stack_size,0x10000000) ;;
-    linux-*)
-      [ -n "$cc" ] || cc=cc
-      asflags=()
-      cflags=(-D_GNU_SOURCE)
-      # crt1.o calls main; data tables hold absolute addresses (-no-pie); the failure banner
-      # resolves behavior names through dladdr (-rdynamic).
-      ldflags=(-no-pie -rdynamic -lpthread) ;;
-    '')
-      asflags=(); cflags=(); ldflags=() ;;
-  esac
-  if [ -n "$platform" ]; then
-    command -v "$cc" >/dev/null 2>&1 || die "$cc is required to assemble and link Silica programs"
-  fi
-
   link_ffi_sidecars "$root" "$build_dir"
+
+  # Nothing changed since the last build (and its program is still there): reuse it.
+  local fingerprint
+  fingerprint="$(build_fingerprint "$build_dir" "$toolchain" "output=$output")" \
+    || die "could not fingerprint the build inputs"
+  if [ "$(cat "$build_dir/.fingerprint" 2>/dev/null)" = "$fingerprint" ] \
+     && { [ -z "$platform" ] || [ -x "$output" ]; }; then
+    if [ -z "$platform" ]; then
+      BUILT_EXE=""
+      step Fresh "$build_dir (unchanged since the last build)"
+    else
+      BUILT_EXE="$output"
+      step Fresh "$output (unchanged since the last build)"
+    fi
+    return 0
+  fi
+  # Something changed. Until this build succeeds the folder holds no reusable program. What the
+  # compiler made last time (assembly, interfaces, atom and shape numbering, the runtime) stays:
+  # plan_incremental decides which units keep theirs. Objects are reused below when their
+  # assembly comes out the same.
+  rm -f "$build_dir/.fingerprint"
+  (cd "$build_dir" && rm -f silica.link silica.needs_runtime silica.up_to_date \
+    silica.compile.order silica.compile.inprogress silica.compile.crashed)
   # A board's FFI archives are built only with a CC for that board.
   if [ -n "$cc" ]; then
     build_ffi_archives "$build_dir" "$cc" ${cflags[@]+"${cflags[@]}"}
   fi
 
   (cd "$build_dir" && topo_sort .units "$entry") > "$build_dir/silica.config" || die "could not order the modules"
-  local count; count="$(grep -c . "$build_dir/silica.config")"
-  step Compiling "$name ($count module$([ "$count" = 1 ] || echo s))$([ "$SEL_TARGET" = "$machine" ] || echo " for $SEL_TARGET") with $(basename "$(readlink "$compiler" 2>/dev/null || echo "$compiler")")"
+  (cd "$build_dir" && plan_incremental) || die "could not work out which modules changed"
+  local count kept=0; count="$(grep -c . "$build_dir/silica.config")"
+  [ -f "$build_dir/silica.up_to_date" ] && kept="$(grep -c . "$build_dir/silica.up_to_date")"
+  step Compiling "$name ($count module$([ "$count" = 1 ] || echo s)$([ "$kept" = 0 ] || echo ", $kept up to date"))$([ "$SEL_TARGET" = "$machine" ] || echo " for $SEL_TARGET") with $(basename "$(readlink "$compiler" 2>/dev/null || echo "$compiler")")"
 
   # Stage 1: silica-compiler reads silica.config from cwd. For multi-unit batches it exits 75/76
   # between units so the OS reclaims memory; re-invoke until it exits 0 or really fails.
@@ -927,7 +1062,7 @@ $(printf '  %s\n' $candidates)" ;;
       (cd "$build_dir" && "$compiler") >> "$log" 2>&1; ec=$?
     fi
     case "$ec" in
-      0) break ;;
+      0) mv "$build_dir/.unit_hashes.next" "$build_dir/.unit_hashes"; break ;;
       75|76) continue ;;
       *)
         if [ "$verbose" != 1 ]; then
@@ -945,20 +1080,49 @@ $(printf '  %s\n' $candidates)" ;;
 
   if [ -z "$platform" ]; then
     BUILT_EXE=""
+    printf '%s\n' "$fingerprint" > "$build_dir/.fingerprint"
     step Finished "$build_dir (assembly for $SEL_TARGET; assemble, link and flash it with the board's toolchain)"
     return 0
   fi
 
-  # Stage 2: assemble every .sams the compiler produced.
-  step Assembling "$name"
-  local sams objs=()
-  while IFS= read -r sams; do
-    local obj="${sams%.sams}.o"
-    "$cc" ${asflags[@]+"${asflags[@]}"} -c -x assembler "$build_dir/$sams" -o "$build_dir/$obj" \
-      || die "assembling $sams failed"
-    objs+=("$build_dir/$obj")
-  done < <(cd "$build_dir" && find . -type f -name '*.sams' | sed 's|^\./||' | LC_ALL=C sort)
-  [ "${#objs[@]}" -gt 0 ] || die "the compiler produced no assembly"
+  # Stage 2: assemble the .sams the compiler produced. .assembled records the hash of the
+  # assembly each object was made from; an object whose assembly came out the same is kept.
+  # The record is removed while assembling, so a failed run leaves nothing to trust.
+  local manifest="$build_dir/.assembled" previous="" current
+  [ -f "$manifest" ] && previous="$(cat "$manifest")"
+  rm -f "$manifest"
+  current="$(cd "$build_dir" && find . -type f -name '*.sams' | sed 's|^\./||' | LC_ALL=C sort \
+    | tr '\n' '\0' | xargs -0 "${SHA256[@]}")"
+  [ -n "$current" ] || die "the compiler produced no assembly"
+  local hash sams objs=() todo=()
+  while read -r hash sams; do
+    [ -n "$sams" ] || continue
+    objs+=("$build_dir/${sams%.sams}.o")
+    if [ -f "$build_dir/${sams%.sams}.o" ] && printf '%s\n' "$previous" | grep -qxF "$hash  $sams"; then
+      continue
+    fi
+    todo+=("$sams")
+  done <<< "$current"
+  # Objects of modules that are gone.
+  local obj
+  while IFS= read -r obj; do
+    [ -f "$build_dir/${obj%.o}.sams" ] || rm -f "$build_dir/$obj"
+  done < <(cd "$build_dir" && find . -type f -name '*.o' -not -path './.ffi/*' | sed 's|^\./||')
+
+  step Assembling "$name (${#todo[@]} of ${#objs[@]} changed)"
+  local jobs pids=() failed=0 pid
+  jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)"
+  for sams in ${todo[@]+"${todo[@]}"}; do
+    "$cc" ${asflags[@]+"${asflags[@]}"} -c -x assembler "$build_dir/$sams" -o "$build_dir/${sams%.sams}.o" &
+    pids+=("$!")
+    if [ "${#pids[@]}" -ge "$jobs" ]; then
+      wait "${pids[0]}" || failed=1
+      pids=("${pids[@]:1}")
+    fi
+  done
+  for pid in ${pids[@]+"${pids[@]}"}; do wait "$pid" || failed=1; done
+  [ "$failed" = 0 ] || die "assembling failed"
+  printf '%s\n' "$current" > "$manifest"
 
   # Stage 3: link, plus any archives the program's FFI wrappers declared in silica.link.
   local archives=()
@@ -975,6 +1139,7 @@ $(printf '  %s\n' $candidates)" ;;
     || die "linking failed"
 
   BUILT_EXE="$output"
+  printf '%s\n' "$fingerprint" > "$build_dir/.fingerprint"
   step Finished "$output"
 }
 
@@ -983,7 +1148,7 @@ $(printf '  %s\n' $candidates)" ;;
 
 cmd_build_or_run() {
   local mode="$1"; shift
-  local target="" output="" verbose=0 prog_args=() host_opt="" target_opt=""
+  local target="" output="" verbose=0 rebuild=0 prog_args=() host_opt="" target_opt=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -o|--output) [ $# -ge 2 ] || die "$1 needs a file name"; output="$2"; shift 2 ;;
@@ -994,6 +1159,7 @@ cmd_build_or_run() {
       --target=*) target_opt="${1#--target=}"; shift ;;
       --host=*)   host_opt="${1#--host=}"; shift ;;
       -v|--verbose) verbose=1; shift ;;
+      --rebuild) rebuild=1; shift ;;
       -h|--help) usage; exit 0 ;;
       --) shift; prog_args=("$@"); break ;;
       -*) die "unknown option: $1 (see: silica help)" ;;
@@ -1013,7 +1179,7 @@ cmd_build_or_run() {
   fi
 
   BUILT_EXE=""
-  build_project "$target" "$output" "$verbose"
+  build_project "$target" "$output" "$verbose" "$rebuild"
 
   if [ "$mode" = run ]; then
     local ec machine
