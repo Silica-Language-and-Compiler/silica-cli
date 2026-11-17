@@ -30,6 +30,7 @@ Hello, world!
 
 - [Install](#install) on macOS (Apple Silicon), Linux on AArch64, or Linux on x86-64
 - [Commands](#commands): `build`, `run`, `update`, `version`
+- [Hosts and targets](#hosts-and-targets): `--host` and `--target`
 - [What a build does](#what-a-build-does)
 - [The specification](#the-specification), installed to `~/.silica/spec`; `silica spec` explains it to AI agents
 - [Contributing and license](#contributing-and-license)
@@ -85,7 +86,8 @@ silica run hello.silica          # build, then execute
 silica run my_app/               # a project folder; main.silica is the entry point
 silica run my_app -- arg1 arg2   # arguments after -- go to the program
 silica build my_app -o bin/app   # choose where the executable goes
-silica update                    # fetch the newest released compiler and specification
+silica build my_app --target linux-aarch64   # generate code for another platform or a board
+silica update                    # update every installed compiler, the specification and stdlib
 silica spec                      # where the specification is and how to use it (for AI agents)
 silica version                   # CLI version, compiler in use, platform
 ```
@@ -138,6 +140,31 @@ A `dangerous_*` module names its Fifi sidecar with `wrapper_meta "dangerous_expo
 
 So `silica run` works for a program that uses the standard library's carriers, with nothing to set up.
 
+## Hosts and targets
+
+A compiler has two platforms. Its **host** is the platform it runs on, and its **target** is the platform it generates code for. By default both are this machine. `build` and `run` accept:
+
+| Option | Meaning |
+| ------ | ------- |
+| `--target <target>` | Generate code for `<target>`: a platform (`macos-applesilicon`, `linux-aarch64`, `linux-x86_64`) or a board (`ESP32_S3_raw`). The compiler repository's spellings work too (`linux_aarch64`, `apple_silicon_mac`, `ESP32-S3_raw`), and board names ignore case. |
+| `--host <platform>` | Use a compiler that runs on `<platform>`. Only useful when this machine can run that platform's binaries, for example through emulation. |
+
+```console
+$ silica build my_app --target ESP32_S3_raw
+no Silica compiler for ESP32_S3_raw (cross compiler on macos-applesilicon) in ~/.silica/bin; fetching the latest release
+ Downloading silica-999955-ESP32_S3_raw-macos-applesilicon (compiler-72af851...)
+   Installed ~/.silica/bin/silica-compiler-ESP32_S3_raw -> silica-999955-ESP32_S3_raw-macos-applesilicon
+   Compiling my_app (1 module) for ESP32_S3_raw with silica-999955-ESP32_S3_raw-macos-applesilicon
+    Finished my_app/.silica-build/ESP32_S3_raw/my_app (assembly for ESP32_S3_raw; ...)
+```
+
+- **The compiler is downloaded when missing.** A target other than the host's own needs a cross compiler, the release asset `silica-<NNNNNN>-<token>-<host>` (the token is the target's name in the compiler repository with `_` for `-`, for example `linux_aarch64` or `ESP32_S3_raw`). The first build for that target downloads it to `~/.silica/bin/silica-compiler-<token>`. If the latest release has no such compiler, the error lists the targets it does have for your host. `silica update --target <target>` installs one ahead of time.
+- **`silica update` updates every installed compiler**: this machine's own, plus each cross compiler a build or `update --target` installed.
+- **Output goes to a folder per target.** A target other than this machine builds into `<project>/.silica-build/<target>/<name>/`.
+- **Another platform needs its own C toolchain.** Assembling and linking for a different platform uses `CC`, or the GNU cross compiler for that platform (`aarch64-linux-gnu-gcc`, `x86_64-linux-gnu-gcc`) when it is installed. Without either, the build stops and says which toolchain to set.
+- **A board stops at assembly.** For a board target the build leaves the compiler's `.sams` output in the build folder, for the board's own toolchain to assemble, link and flash. `-o` does not apply, and `silica run` refuses a board target.
+- **Running another platform's program.** `silica run --target <platform>` builds the program and then executes it. That only works where the OS can run that platform's binaries (for example Linux with `binfmt` and QEMU). Otherwise the CLI says to copy the executable to a machine of that platform.
+
 ## What a build does
 
 A build runs the same three stages as the Silica repository's [project Makefiles](https://github.com/Silica-Language-and-Compiler/silica/tree/main/project_makefiles):
@@ -148,7 +175,7 @@ A build runs the same three stages as the Silica repository's [project Makefiles
 
 Before stage 1, the CLI builds any missing FFI wrapper archives; see [FFI wrappers](#ffi-wrappers).
 
-The compiler lives in `~/.silica/bin`. It is the `silica-<NNNNNN>-<platform>` asset from the [latest release](https://github.com/Silica-Language-and-Compiler/silica/releases/latest), and `silica-compiler` links to it. When a release has several, the CLI takes the lowest number, which is the newest compiler.
+The compiler lives in `~/.silica/bin`. It is the `silica-<NNNNNN>-<platform>` asset from the [latest release](https://github.com/Silica-Language-and-Compiler/silica/releases/latest), and `silica-compiler` links to it. When a release has several, the CLI takes the lowest number, which is the newest compiler. Cross compilers sit beside it; see [Hosts and targets](#hosts-and-targets).
 
 ## The specification
 
@@ -156,7 +183,8 @@ The language specification ships with each compiler release as `silica-specifica
 
 ```
 ~/.silica/
-├── bin/          silica, silica-compiler -> silica-<NNNNNN>-<platform>
+├── bin/          silica, silica-compiler -> silica-<NNNNNN>-<platform>,
+│                 silica-compiler-<token> -> silica-<NNNNNN>-<token>-<platform> (cross compilers)
 ├── spec/         silica-specification.md, silica_ffi_wrapper_specification.md, ROADMAP.md, ...
 ├── spec.release  the compiler release the specification came from
 ├── stdlib/       the standard library sources (compiler/stdlib at that release)
@@ -181,12 +209,11 @@ silica-cli/
 ├── src/silica.sh   the CLI (bash 3.2-compatible, so it runs on stock macOS)
 ├── silica          launcher, so ./silica works from a clone
 ├── install.sh      the installer (release download, or link to a clone)
-├── examples/       sample programs
 └── tests/run.sh    end-to-end tests against a real compiler
 ```
 
 ```bash
-./silica run examples/hello-world
+./silica run path/to/program.silica
 tests/run.sh
 ```
 

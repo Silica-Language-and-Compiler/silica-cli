@@ -36,7 +36,16 @@ wanted: $want_out"
 
 # --- fixtures -------------------------------------------------------------
 
-cp -R "$root/examples/hello-world" "$work/hello-world"
+mkdir -p "$work/hello-world"
+cat > "$work/hello-world/main.silica" <<'EOF'
+fn main() -> atom {
+    sequence proc[device_io]
+        _: atom <- println("Hello, world!")
+    produces
+        pure :ok
+    end
+}
+EOF
 
 mkdir -p "$work/single"
 cat > "$work/single/greet.silica" <<'EOF'
@@ -133,6 +142,45 @@ if [ -n "$(find "$work/ffi-stdlib" -not -path '*/.silica-build*' -name '*.a')" ]
 else
   pass "FFI archive stays in the build folder"
 fi
+
+# --host and --target. This machine's own target, by any spelling, is the default build.
+machine="$("$cli" version | sed -n 's/^platform: //p')"
+expect "run --target this machine"      2 "greetings"     -- "$cli" run "$work/single/greet.silica" --target "$machine"
+expect "run --target= --host="          2 "greetings"     -- "$cli" run "$work/single/greet.silica" --target="$machine" --host="$machine"
+expect "unknown host fails"             1 ""              -- "$cli" build "$work/single/greet.silica" --host windows
+expect "invalid target fails"           1 ""              -- "$cli" build "$work/single/greet.silica" --target 'a/b'
+expect "--target without a value fails" 1 ""              -- "$cli" build "$work/single/greet.silica" --target
+expect "run on a board target fails"    1 ""              -- "$cli" run "$work/single/greet.silica" --target ESP32_S3_raw
+# Releases carry an ESP32-S3 cross compiler for macOS only. Building for it downloads it.
+home="${SILICA_HOME:-$HOME/.silica}"
+if [ "$machine" = macos-applesilicon ]; then
+  expect "build for a board target"     0 ""              -- "$cli" build "$work/single/greet.silica" --target esp32-s3_raw
+  if [ -f "$work/single/.silica-build/ESP32_S3_raw/greet/greet.sams" ] && [ -x "$home/bin/silica-compiler-ESP32_S3_raw" ]; then
+    pass "board build installs its compiler and emits assembly"
+  else
+    fail "board build installs its compiler and emits assembly"
+  fi
+  expect "-o with a board target fails" 1 ""              -- "$cli" build "$work/single/greet.silica" --target ESP32_S3_raw -o "$work/x"
+  # A near-miss target name fails with the command it should have been.
+  expect "near-miss target fails"       1 ""              -- "$cli" build "$work/single/greet.silica" --target esp32-s3
+  if grep -F "silica build $work/single/greet.silica --target ESP32_S3_raw" "$work/stderr" >/dev/null; then
+    pass "near-miss target suggests the right command"
+  else
+    fail "near-miss target suggests the right command" "$(cat "$work/stderr")"
+  fi
+fi
+
+# `silica update` also refreshes every cross compiler that is installed.
+if [ -f "$home/bin/silica-compiler-ESP32_S3_raw.release" ]; then
+  echo "compiler-old silica-999999-ESP32_S3_raw-$machine" > "$home/bin/silica-compiler-ESP32_S3_raw.release"
+  expect "update refreshes cross compilers" 0 ""          -- "$cli" update
+  if grep -q '^compiler-old ' "$home/bin/silica-compiler-ESP32_S3_raw.release"; then
+    fail "cross compiler updated" "$(cat "$home/bin/silica-compiler-ESP32_S3_raw.release")"
+  else
+    pass "cross compiler updated"
+  fi
+fi
+expect "update bad option fails"        1 ""              -- "$cli" update --bogus
 
 # `silica update` installs the specification flat into $SILICA_HOME/spec.
 spec_dir="${SILICA_HOME:-$HOME/.silica}/spec"
