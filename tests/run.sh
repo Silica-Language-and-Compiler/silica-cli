@@ -299,5 +299,65 @@ else
   pass "source tree stays clean"
 fi
 
+# --- update --golden (gh is stubbed; no network) --------------------------
+
+gold="$work/golden"
+mkdir -p "$gold/bin" "$gold/fixture/golden-linux_x86_64-shard-0" "$gold/fixture/golden-ESP32-S3_raw-shard-0" \
+         "$gold/silica/trials/foo_addition" "$gold/silica/trials/other"
+cat > "$gold/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+  auth) exit 0 ;;
+  api) printf 'golden-linux_x86_64-shard-0\ngolden-ESP32-S3_raw-shard-0\nlogs-other\n'; exit 0 ;;
+  run)
+    if [ "$2" = list ]; then echo 4242; exit 0; fi
+    # run download <id> -R <repo> -n <name> -D <dir>
+    name=""; dir=""
+    while [ $# -gt 0 ]; do case "$1" in -n) name="$2"; shift ;; -D) dir="$2"; shift ;; esac; shift; done
+    cp -R "$GOLDEN_FIXTURE/$name/." "$dir/"; exit 0 ;;
+esac
+exit 1
+EOF
+chmod +x "$gold/bin/gh"
+fx="$gold/fixture/golden-linux_x86_64-shard-0"
+mkdir -p "$fx/foo_addition" "$fx/newsuite"
+printf 'new asm\n' > "$fx/foo_addition/bar.ascomp"
+printf 'same\n' > "$fx/foo_addition/same.scout"
+printf 'evil\n' > "$fx/foo_addition/bad.txt"
+printf 'nosuite\n' > "$fx/newsuite/x.ascomp"
+printf 'target=linux_x86_64\nfoo_addition/bar.ascomp\nfoo_addition/same.scout\n../escape.ascomp\n/abs/x.ascomp\nfoo_addition/../../escape2.ascomp\nfoo_addition/bad.txt\nnewsuite/x.ascomp\nMANIFEST.txt\n' > "$fx/MANIFEST.txt"
+fe="$gold/fixture/golden-ESP32-S3_raw-shard-0"
+mkdir -p "$fe/other"; printf 'esp asm\n' > "$fe/other/q.ESP32-S3_raw.ascomp"
+printf 'target=ESP32-S3_raw\nother/q.ESP32-S3_raw.ascomp\n' > "$fe/MANIFEST.txt"
+st="$gold/silica/trials"
+printf 'old asm\n' > "$st/foo_addition/bar.ascomp"
+printf 'same\n' > "$st/foo_addition/same.scout"
+ggh() { env PATH="$gold/bin:$PATH" GOLDEN_FIXTURE="$gold/fixture" "$cli" update --golden --silica-dir "$gold/silica" "$@"; }
+
+expect "golden dry-run succeeds"        0 ""              -- ggh --dry-run
+if [ "$(cat "$st/foo_addition/bar.ascomp")" = "old asm" ] && [ ! -e "$st/other/q.ESP32-S3_raw.ascomp" ]; then
+  pass "golden dry-run changes nothing"
+else fail "golden dry-run changes nothing"; fi
+
+printf 'secret\n' > "$gold/secret.txt"
+ln -s "$gold/secret.txt" "$fx/foo_addition/link.ascomp"
+printf 'foo_addition/link.ascomp\n' >> "$fx/MANIFEST.txt"
+expect "golden install"                 0 ""              -- ggh --run 4242
+[ "$(cat "$st/foo_addition/bar.ascomp")" = "new asm" ] && pass "golden overwrites existing file" || fail "golden overwrites existing file"
+[ -f "$st/other/q.ESP32-S3_raw.ascomp" ] && pass "golden installs new file" || fail "golden installs new file"
+[ ! -e "$st/MANIFEST.txt" ] && [ ! -e "$st/foo_addition/MANIFEST.txt" ] && pass "golden does not copy MANIFEST.txt" || fail "golden does not copy MANIFEST.txt"
+if [ ! -e "$gold/silica/escape.ascomp" ] && [ ! -e "$gold/escape2.ascomp" ] && [ ! -e "$st/foo_addition/bad.txt" ] \
+   && [ ! -d "$st/newsuite" ]; then
+  pass "golden rejects traversal, absolute, bad extension, new suites"
+else fail "golden rejects traversal, absolute, bad extension, new suites"; fi
+out="$(ggh --run https://github.com/Silica-Language-and-Compiler/silica/actions/runs/4242 2>&1)"
+case "$out" in *"1 unchanged"*"skipped"*) pass "golden summary reports unchanged/skipped" ;; *) fail "golden summary reports unchanged/skipped" "$out" ;; esac
+[ ! -e "$st/foo_addition/link.ascomp" ] && pass "golden rejects symlinked artifact files" || fail "golden rejects symlinked artifact files"
+printf 'old asm\n' > "$st/foo_addition/bar.ascomp"
+expect "golden --target filter"         0 ""              -- ggh --target ESP32-S3_raw
+[ "$(cat "$st/foo_addition/bar.ascomp")" = "old asm" ] && pass "golden --target skips other targets" || fail "golden --target skips other targets"
+expect "golden no matching artifacts fails" 1 ""          -- ggh --target nonesuch
+expect "golden bad --run fails"         1 ""              -- ggh --run abc
+
 printf '\n%d passed, %d failed\n' "$passed" "$failed"
 [ "$failed" -eq 0 ]

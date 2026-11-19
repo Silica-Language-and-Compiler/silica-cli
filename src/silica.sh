@@ -58,7 +58,9 @@ Commands:
                   compilers) up to the latest release, and install the language
                   specification (Markdown) into ~/.silica/spec and the standard
                   library sources into ~/.silica/stdlib. --target/--host also
-                  install that compiler.
+                  install that compiler. `update --golden` instead pulls golden
+                  assembly from a Trials run into a silica checkout's trials/
+                  (see: silica update --help).
   sildat <in> <out>
                   Pack <in> into a Silica store backing at <out>: one record per
                   non-empty line, the line as a string. --capacity must match the
@@ -1529,9 +1531,228 @@ sys.stdout.write("wrote %d %s in %d %s to %s (capacity %d)\n" % (seq, line_unit,
 PY
 }
 
-# `silica update [--host <platform>] [--target <target>]`
+# Extensions `update --golden` may install. Anything else in a MANIFEST.txt is skipped.
+SILICA_GOLDEN_EXTENSIONS="ascomp scout"
+
+# `silica update --golden [options]`: install golden assembly from a Trials run.
+cmd_update_golden() {
+  local run="" repo="" sdir="" dry=0 targets="" a
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --run|--repo|--silica-dir|--target)
+        [ $# -ge 2 ] || die "$1 needs a value (see: silica update --help)"
+        a="$2"
+        case "$1" in
+          --run) run="$a" ;; --repo) repo="$a" ;; --silica-dir) sdir="$a" ;;
+          --target) targets="$targets,$a" ;;
+        esac
+        shift 2 ;;
+      --run=*) run="${1#--run=}"; shift ;;
+      --repo=*) repo="${1#--repo=}"; shift ;;
+      --silica-dir=*) sdir="${1#--silica-dir=}"; shift ;;
+      --target=*) targets="$targets,${1#--target=}"; shift ;;
+      --dry-run) dry=1; shift ;;
+      *) die "unknown option for update --golden: $1 (see: silica update --help)" ;;
+    esac
+  done
+  targets="${targets//,/ }"
+
+  command -v gh >/dev/null 2>&1 || die "update --golden needs the GitHub CLI (gh): https://cli.github.com"
+  gh auth status >/dev/null 2>&1 || die "gh is not authenticated; run: gh auth login"
+
+  # Where the silica checkout is: --silica-dir, then $SILICA_DIR, then the git toplevel of cwd.
+  if [ -z "$sdir" ]; then sdir="${SILICA_DIR:-}"; fi
+  if [ -z "$sdir" ]; then
+    sdir="$(git rev-parse --show-toplevel 2>/dev/null)" || sdir=""
+    [ -n "$sdir" ] && [ -d "$sdir/trials" ] || die "cannot find the silica checkout (no trials/ folder); pass --silica-dir <path> or set SILICA_DIR"
+  fi
+  [ -d "$sdir/trials" ] || die "$sdir has no trials/ folder (is it a silica checkout?)"
+  local trials
+  trials="$(cd -P "$sdir/trials" && pwd -P)" || die "cannot enter $sdir/trials"
+
+  # Run id (and repo) from --run; else the latest completed Trials run.
+  case "$run" in
+    http*://*/actions/runs/*)
+      if [ -z "$repo" ]; then
+        repo="${run#*://*/}"; repo="${repo%%/actions/*}"
+      fi
+      run="${run#*/actions/runs/}"; run="${run%%[/?#]*}" ;;
+  esac
+  [ -n "$repo" ] || repo="$SILICA_REPO"
+  if [ -n "$run" ]; then
+    case "$run" in *[!0-9]*) die "--run needs a numeric run id or an actions run URL" ;; esac
+  else
+    local branch
+    branch="$(git -C "$sdir" rev-parse --abbrev-ref HEAD 2>/dev/null)" || branch=""
+    [ "$branch" = HEAD ] && branch=""
+    if [ -n "$branch" ]; then
+      run="$(gh run list -R "$repo" -w trials.yml -b "$branch" -s completed -L 1 --json databaseId --jq '.[0].databaseId // empty' 2>/dev/null)" || run=""
+    fi
+    if [ -z "$run" ]; then
+      run="$(gh run list -R "$repo" -w trials.yml -s completed -L 1 --json databaseId --jq '.[0].databaseId // empty' 2>/dev/null)" || run=""
+      [ -n "$run" ] || die "no completed Trials run found in $repo"
+      [ -z "$branch" ] || warn "no completed Trials run on branch '$branch'; using the latest on any branch"
+    fi
+  fi
+  info "using $repo run $run"
+
+  local names
+  names="$(gh api "repos/$repo/actions/runs/$run/artifacts" --paginate --jq '.artifacts[] | select(.expired | not) | .name' 2>/dev/null)" \
+    || die "cannot list artifacts of run $run in $repo"
+
+  local results n tgt t keep tmp
+  GOLDEN_TMP="$(mktemp -d "${TMPDIR:-/tmp}/silica-golden.XXXXXX")" || die "cannot create a temporary folder"
+  trap 'rm -rf "${GOLDEN_TMP:-}"' EXIT
+  tmp="$GOLDEN_TMP"
+  results="$tmp/results.txt"; : > "$results"
+  local found=0 golden_fail=0
+  GOLDEN_HASH=""
+  if command -v sha256sum >/dev/null 2>&1; then GOLDEN_HASH="sha256sum"
+  elif command -v shasum >/dev/null 2>&1; then GOLDEN_HASH="shasum -a 256"
+  else die "update --golden needs sha256sum or shasum"; fi
+
+  while IFS= read -r n; do
+    case "$n" in golden-*) ;; *) continue ;; esac
+    tgt="${n#golden-}"; tgt="${tgt%-shard-*}"
+    if [ -n "$targets" ]; then
+      keep=0; for t in $targets; do [ "$t" = "$tgt" ] && keep=1; done
+      [ "$keep" = 1 ] || continue
+    fi
+    found=$((found + 1))
+    local ad="$tmp/artifacts/$n"
+    mkdir -p "$ad"
+    if ! gh run download "$run" -R "$repo" -n "$n" -D "$ad" >/dev/null 2>&1; then
+      warn "could not download artifact $n"; continue
+    fi
+    local man="$ad/MANIFEST.txt"
+    if [ ! -f "$man" ] || [ -L "$man" ]; then warn "$n has no MANIFEST.txt; skipping the artifact"; continue; fi
+    local mt="$tgt" first
+    IFS= read -r first < "$man" || first=""
+    first="${first%$'\r'}"
+    case "$first" in target=*) mt="${first#target=}" ;; esac
+    # Bulk checks, one pass each: what regular files the artifact holds (symlinks are never
+    # listed, nor is anything below one), and which folders, files and symlinks trials/ has.
+    ( cd "$ad" && find . -type f ) | sed 's|^\./||' > "$ad.src"
+    ( cd "$trials" && find . -type d ) | sed 's|^\./||; s|^\.$||' > "$tmp/t.dirs"
+    ( cd "$trials" && find . -type l ) | sed 's|^\./||' > "$tmp/t.links"
+    ( cd "$trials" && find . -type f ) | sed 's|^\./||' > "$tmp/t.files"
+    : > "$ad.warn"; : > "$ad.ex"; : > "$ad.nw"
+    awk -v mt="$mt" -v exts="$SILICA_GOLDEN_EXTENSIONS" -v results="$results" -v warnf="$ad.warn" \
+        -v exf="$ad.ex" -v nwf="$ad.nw" -v srcf="$ad.src" -v dirf="$tmp/t.dirs" \
+        -v linkf="$tmp/t.links" -v filef="$tmp/t.files" '
+      function load(f, set,   l) { while ((getline l < f) > 0) set[l] = 1; close(f) }
+      function ok(p,   n, i, parts, e) {
+        if (p == "" || substr(p, 1, 1) == "/") return 0
+        if (p ~ /\\/ || p ~ /[[:cntrl:]]/) return 0
+        if (index(p, "/") == 0) return 0
+        n = split(p, parts, "/")
+        for (i = 1; i <= n; i++) if (parts[i] == "" || parts[i] == "." || parts[i] == "..") return 0
+        e = p; if (!sub(/^.*\./, "", e)) return 0
+        for (i = 1; i <= nx; i++) if (xs[i] == e) return 1
+        return 0
+      }
+      function skip(p, why) { print mt " skipped" >> results; print why ": " p >> warnf }
+      BEGIN {
+        nx = split(exts, xs, " ")
+        load(srcf, src); load(dirf, dirs); load(linkf, links); load(filef, files)
+      }
+      { sub(/\r$/, "") }
+      FNR == 1 && /^target=/ { next }
+      $0 == "" || $0 == "MANIFEST.txt" { next }
+      {
+        p = $0
+        if (!ok(p)) { skip(p, "skipping unsafe or unsupported path"); next }
+        if (!(p in src)) { skip(p, "skipping (missing, not a regular file, or a symlink)"); next }
+        d = p; sub(/\/[^\/]*$/, "", d); s = p; sub(/\/.*$/, "", s)
+        if (p in links) { skip(p, "skipping (destination in trials/ is a symlink)"); next }
+        if (!(s in dirs) || !(d in dirs)) {
+          skip(p, "skipping (trial folder does not exist in trials/)"); next
+        }
+        if (p in files) print p >> exf; else print p >> nwf
+      }' "$man"
+    local w
+    while IFS= read -r w; do warn "$n: $w"; done < "$ad.warn"
+    # Compare existing goldens by checksum, in batches (no process per file).
+    : > "$ad.hs"; : > "$ad.hd"
+    if [ -s "$ad.ex" ]; then
+      ( cd "$ad" && sed 's|^|./|' "$ad.ex" | tr '\n' '\0' | xargs -0 -n 500 $GOLDEN_HASH ) > "$ad.hs"
+      ( cd "$trials" && sed 's|^|./|' "$ad.ex" | tr '\n' '\0' | xargs -0 -n 500 $GOLDEN_HASH ) > "$ad.hd"
+    fi
+    : > "$ad.cp"
+    awk -v mt="$mt" -v dry="$dry" -v results="$results" -v cpf="$ad.cp" -v hs="$ad.hs" -v hd="$ad.hd" -v nwf="$ad.nw" '
+      function hp(l) { return substr(l, index(l, "  ") + 2) }
+      function hash(l) { return substr(l, 1, index(l, "  ") - 1) }
+      function note(st, p) {
+        print mt " " st >> results
+        if (st != "unchanged") {
+          print p >> cpf
+          if (dry == 1) print "would " (st == "new" ? "add" : "update") " " p
+        }
+      }
+      BEGIN {
+        while ((getline l < hs) > 0) { p = hp(l); sub(/^\.\//, "", p); sh[p] = hash(l) }
+        while ((getline l < hd) > 0) { p = hp(l); sub(/^\.\//, "", p); dh[p] = hash(l) }
+        for (p in sh) note((p in dh && dh[p] == sh[p]) ? "unchanged" : "updated", p)
+        while ((getline p < nwf) > 0) note("new", p)
+      }'
+    if [ "$dry" = 0 ] && [ -s "$ad.cp" ]; then
+      if ! { tar -C "$ad" -cf - -T "$ad.cp" | tar -C "$trials" -xf -; } 2>/dev/null; then
+        warn "$n: could not write some files into $trials"; golden_fail=1
+      fi
+    fi
+    rm -rf "$ad" "$ad".*
+  done <<EOT
+$names
+EOT
+
+  [ "$found" -gt 0 ] || die "no golden-* artifacts${targets:+ for target(s):$targets} in run $run of $repo (did the Trials run finish, and have the artifacts expired?)"
+
+  [ "$dry" = 1 ] && echo "Dry run: nothing was written."
+  echo "Golden files from run $run into $trials:"
+  awk '{ t[$1]=1; c[$1" "$2]++ }
+       END { for (k in t) print k }' "$results" | sort | while IFS= read -r t; do
+    awk -v t="$t" -v dry="$dry" '$1==t { c[$2]++ }
+      END { printf "  %-18s %d %s, %d unchanged, %d new, %d skipped\n", t, c["updated"], (dry ? "to update" : "updated"), c["unchanged"], c["new"], c["skipped"] }' "$results"
+  done
+  [ -s "$results" ] || echo "  (the artifacts listed no files)"
+  return "$golden_fail"
+}
+
+update_help() {
+  cat <<'EOF'
+Usage: silica update [--host <platform>] [--target <target>]
+       silica update --golden [--run <id|url>] [--target <name>]... [--repo <owner/name>]
+                              [--silica-dir <path>] [--dry-run]
+
+Without --golden: update the installed compilers, specification and stdlib.
+
+With --golden: download the golden assembly (*.ascomp, *.scout) that a GitHub
+Actions "Trials" run generated (artifacts golden-<target>-shard-<n>) and install
+it into <silica-dir>/trials, overwriting existing files. Needs gh, logged in.
+  --run <id|url>        Run to pull from (default: latest completed trials.yml run
+                        on the checkout's current branch, else on any branch)
+  --target <name>       Only this target (apple_silicon_mac, linux_aarch64,
+                        linux_x86_64, ESP32-S3_raw); repeat or comma-separate
+  --repo <owner/name>   Default: Silica-Language-and-Compiler/silica
+  --silica-dir <path>   The silica checkout (default: $SILICA_DIR, else the git
+                        toplevel of the current folder if it has trials/)
+  --dry-run             List what would change; write nothing
+Only files listed in each artifact's MANIFEST.txt are installed, and only into
+trial folders that already exist.
+EOF
+}
+
+# `silica update [--host <platform>] [--target <target>]`, or `silica update --golden ...`
 cmd_update() {
-  local host_opt="" target_opt=""
+  local host_opt="" target_opt="" arg
+  local rest=() golden=0
+  for arg in "$@"; do
+    if [ "$arg" = --golden ]; then golden=1; else rest+=("$arg"); fi
+  done
+  if [ "$golden" = 1 ]; then
+    case " ${rest[*]:-} " in *" -h "*|*" --help "*) update_help; return 0 ;; esac
+    cmd_update_golden ${rest[@]+"${rest[@]}"}; return $?
+  fi
   while [ $# -gt 0 ]; do
     case "$1" in
       --target|--host)
@@ -1540,7 +1761,7 @@ cmd_update() {
         shift 2 ;;
       --target=*) target_opt="${1#--target=}"; shift ;;
       --host=*)   host_opt="${1#--host=}"; shift ;;
-      -h|--help) echo "Usage: silica update [--host <platform>] [--target <target>]"; return 0 ;;
+      -h|--help) update_help; return 0 ;;
       *) die "unknown option for update: $1 (expected --host or --target)" ;;
     esac
   done
