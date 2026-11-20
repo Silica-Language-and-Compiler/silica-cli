@@ -46,6 +46,8 @@ die()  { printf '%serror:%s %s\n' "$c_red" "$c_off" "$*" >&2; exit 1; }
 info() { printf '%s%s%s\n' "$c_dim" "$*" "$c_off" >&2; }
 warn() { printf '%swarning:%s %s\n' "$c_red" "$c_off" "$*" >&2; }
 step() { printf '%s%12s%s %s\n' "$c_green$c_bold" "$1" "$c_off" "$2" >&2; }
+# fd 9 is the terminal's stderr, so progress_run can draw while a caller discards stderr.
+exec 9>&2
 
 usage() {
   cat <<'EOF'
@@ -1538,6 +1540,69 @@ PY
 # Extensions `update --golden` may install. Anything else in a MANIFEST.txt is skipped.
 SILICA_GOLDEN_EXTENSIONS="ascomp scout"
 
+# progress_run <done> <total> <label> <command...>: runs <command> (its output goes wherever
+# the caller sends it) and meanwhile redraws one progress line on the terminal:
+#     Fetching [=========>               ] 3/10 /: downloading golden-linux_x86_64-shard-0
+# With <total> 0 it shows just a spinner after <label>. The line is erased when the command
+# exits; nothing is drawn when the script's stderr (fd 9) is not a terminal. Returns the
+# command's exit status.
+progress_run() {
+  local ndone="$1" total="$2" label="$3"; shift 3
+  if [ ! -t 9 ]; then "$@"; return; fi
+  local pid ec cols width=25 frame=0 spin='|/-\' bar line i filled
+  cols="$(tput cols 2>/dev/null || echo 80)"
+  "$@" &
+  pid=$!
+  # A background job in a script ignores SIGINT, so pass Ctrl-C (and kills) on to it.
+  trap 'kill "$pid" 2>/dev/null; printf "\r\033[K" >&9; exit 130' INT TERM
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$total" -gt 0 ]; then
+      filled=$(( ndone * width / total ))
+      bar=""; i=0
+      while [ "$i" -lt "$width" ]; do
+        if [ "$i" -lt "$filled" ]; then bar="$bar="
+        elif [ "$i" -eq "$filled" ]; then bar="$bar>"
+        else bar="$bar "; fi
+        i=$((i + 1))
+      done
+      line="$(printf '[%s] %d/%d %s: %s' "$bar" "$ndone" "$total" "${spin:$((frame % 4)):1}" "$label")"
+      line="${line:0:$((cols > 14 ? cols - 14 : 1))}"
+      printf '\r\033[K%s%12s%s %s' "$c_bold$c_cyan" Fetching "$c_off" "$line" >&9
+    else
+      line="$(printf '%s %s' "$label" "${spin:$((frame % 4)):1}")"
+      line="${line:0:$((cols > 1 ? cols - 1 : 1))}"
+      printf '\r\033[K%s%s%s' "$c_dim" "$line" "$c_off" >&9
+    fi
+    frame=$((frame + 1))
+    sleep 0.1
+  done
+  wait "$pid"; ec=$?
+  trap - INT TERM
+  printf '\r\033[K' >&9
+  return "$ec"
+}
+
+# golden_scan <artifact dir> <trials dir> <tmp>: list the artifact's regular files (symlinks are
+# never listed, nor is anything below one), and which folders, files and symlinks trials/ has.
+golden_scan() {
+  ( cd "$1" && find . -type f ) | sed 's|^\./||' > "$1.src"
+  ( cd "$2" && find . -type d ) | sed 's|^\./||; s|^\.$||' > "$3/t.dirs"
+  ( cd "$2" && find . -type l ) | sed 's|^\./||' > "$3/t.links"
+  ( cd "$2" && find . -type f ) | sed 's|^\./||' > "$3/t.files"
+}
+
+# golden_hash <artifact dir> <trials dir>: checksum the files listed in <artifact dir>.ex in
+# both places, in batches (no process per file), into <artifact dir>.hs and .hd.
+golden_hash() {
+  ( cd "$1" && sed 's|^|./|' "$1.ex" | tr '\n' '\0' | xargs -0 -n 500 $GOLDEN_HASH ) > "$1.hs"
+  ( cd "$2" && sed 's|^|./|' "$1.ex" | tr '\n' '\0' | xargs -0 -n 500 $GOLDEN_HASH ) > "$1.hd"
+}
+
+# golden_copy <artifact dir> <trials dir>: copy the files listed in <artifact dir>.cp.
+golden_copy() {
+  { tar -C "$1" -cf - -T "$1.cp" | tar -C "$2" -xf -; } 2>/dev/null
+}
+
 # `silica update --golden [options]`: install golden assembly from a Trials run.
 cmd_update_golden() {
   local run="" repo="" sdir="" dry=0 targets="" a
@@ -1590,10 +1655,12 @@ cmd_update_golden() {
     branch="$(git -C "$sdir" rev-parse --abbrev-ref HEAD 2>/dev/null)" || branch=""
     [ "$branch" = HEAD ] && branch=""
     if [ -n "$branch" ]; then
-      run="$(gh run list -R "$repo" -w trials.yml -b "$branch" -s completed -L 1 --json databaseId --jq '.[0].databaseId // empty' 2>/dev/null)" || run=""
+      run="$(progress_run 0 0 "Finding the latest Trials run on $branch" \
+        gh run list -R "$repo" -w trials.yml -b "$branch" -s completed -L 1 --json databaseId --jq '.[0].databaseId // empty' 2>/dev/null)" || run=""
     fi
     if [ -z "$run" ]; then
-      run="$(gh run list -R "$repo" -w trials.yml -s completed -L 1 --json databaseId --jq '.[0].databaseId // empty' 2>/dev/null)" || run=""
+      run="$(progress_run 0 0 "Finding the latest Trials run" \
+        gh run list -R "$repo" -w trials.yml -s completed -L 1 --json databaseId --jq '.[0].databaseId // empty' 2>/dev/null)" || run=""
       [ -n "$run" ] || die "no completed Trials run found in $repo"
       [ -z "$branch" ] || warn "no completed Trials run on branch '$branch'; using the latest on any branch"
     fi
@@ -1601,10 +1668,25 @@ cmd_update_golden() {
   info "using $repo run $run"
 
   local names
-  names="$(gh api "repos/$repo/actions/runs/$run/artifacts" --paginate --jq '.artifacts[] | select(.expired | not) | .name' 2>/dev/null)" \
+  names="$(progress_run 0 0 "Listing artifacts of run $run" \
+    gh api "repos/$repo/actions/runs/$run/artifacts" --paginate --jq '.artifacts[] | select(.expired | not) | .name' 2>/dev/null)" \
     || die "cannot list artifacts of run $run in $repo"
 
-  local results n tgt t keep tmp
+  # The golden-* artifacts wanted (per --target), so the progress bar knows the total.
+  local wanted="" total=0 n tgt t keep
+  while IFS= read -r n; do
+    case "$n" in golden-*) ;; *) continue ;; esac
+    tgt="${n#golden-}"; tgt="${tgt%-shard-*}"
+    if [ -n "$targets" ]; then
+      keep=0; for t in $targets; do [ "$t" = "$tgt" ] && keep=1; done
+      [ "$keep" = 1 ] || continue
+    fi
+    wanted="$wanted$n"$'\n'; total=$((total + 1))
+  done <<EOT
+$names
+EOT
+
+  local results tmp
   GOLDEN_TMP="$(mktemp -d "${TMPDIR:-/tmp}/silica-golden.XXXXXX")" || die "cannot create a temporary folder"
   trap 'rm -rf "${GOLDEN_TMP:-}"' EXIT
   tmp="$GOLDEN_TMP"
@@ -1616,16 +1698,13 @@ cmd_update_golden() {
   else die "update --golden needs sha256sum or shasum"; fi
 
   while IFS= read -r n; do
-    case "$n" in golden-*) ;; *) continue ;; esac
+    [ -n "$n" ] || continue
     tgt="${n#golden-}"; tgt="${tgt%-shard-*}"
-    if [ -n "$targets" ]; then
-      keep=0; for t in $targets; do [ "$t" = "$tgt" ] && keep=1; done
-      [ "$keep" = 1 ] || continue
-    fi
+    local ad="$tmp/artifacts/$n" i="$found"
     found=$((found + 1))
-    local ad="$tmp/artifacts/$n"
     mkdir -p "$ad"
-    if ! gh run download "$run" -R "$repo" -n "$n" -D "$ad" >/dev/null 2>&1; then
+    if ! progress_run "$i" "$total" "downloading $n" \
+        gh run download "$run" -R "$repo" -n "$n" -D "$ad" >/dev/null 2>&1; then
       warn "could not download artifact $n"; continue
     fi
     local man="$ad/MANIFEST.txt"
@@ -1634,12 +1713,8 @@ cmd_update_golden() {
     IFS= read -r first < "$man" || first=""
     first="${first%$'\r'}"
     case "$first" in target=*) mt="${first#target=}" ;; esac
-    # Bulk checks, one pass each: what regular files the artifact holds (symlinks are never
-    # listed, nor is anything below one), and which folders, files and symlinks trials/ has.
-    ( cd "$ad" && find . -type f ) | sed 's|^\./||' > "$ad.src"
-    ( cd "$trials" && find . -type d ) | sed 's|^\./||; s|^\.$||' > "$tmp/t.dirs"
-    ( cd "$trials" && find . -type l ) | sed 's|^\./||' > "$tmp/t.links"
-    ( cd "$trials" && find . -type f ) | sed 's|^\./||' > "$tmp/t.files"
+    # Bulk checks, one pass each (see golden_scan).
+    progress_run "$i" "$total" "scanning $n" golden_scan "$ad" "$trials" "$tmp"
     : > "$ad.warn"; : > "$ad.ex"; : > "$ad.nw"
     awk -v mt="$mt" -v exts="$SILICA_GOLDEN_EXTENSIONS" -v results="$results" -v warnf="$ad.warn" \
         -v exf="$ad.ex" -v nwf="$ad.nw" -v srcf="$ad.src" -v dirf="$tmp/t.dirs" \
@@ -1679,8 +1754,7 @@ cmd_update_golden() {
     # Compare existing goldens by checksum, in batches (no process per file).
     : > "$ad.hs"; : > "$ad.hd"
     if [ -s "$ad.ex" ]; then
-      ( cd "$ad" && sed 's|^|./|' "$ad.ex" | tr '\n' '\0' | xargs -0 -n 500 $GOLDEN_HASH ) > "$ad.hs"
-      ( cd "$trials" && sed 's|^|./|' "$ad.ex" | tr '\n' '\0' | xargs -0 -n 500 $GOLDEN_HASH ) > "$ad.hd"
+      progress_run "$i" "$total" "comparing $n" golden_hash "$ad" "$trials"
     fi
     : > "$ad.cp"
     awk -v mt="$mt" -v dry="$dry" -v results="$results" -v cpf="$ad.cp" -v hs="$ad.hs" -v hd="$ad.hd" -v nwf="$ad.nw" '
@@ -1700,13 +1774,13 @@ cmd_update_golden() {
         while ((getline p < nwf) > 0) note("new", p)
       }'
     if [ "$dry" = 0 ] && [ -s "$ad.cp" ]; then
-      if ! { tar -C "$ad" -cf - -T "$ad.cp" | tar -C "$trials" -xf -; } 2>/dev/null; then
+      if ! progress_run "$i" "$total" "installing $n" golden_copy "$ad" "$trials"; then
         warn "$n: could not write some files into $trials"; golden_fail=1
       fi
     fi
     rm -rf "$ad" "$ad".*
   done <<EOT
-$names
+$wanted
 EOT
 
   [ "$found" -gt 0 ] || die "no golden-* artifacts${targets:+ for target(s):$targets} in run $run of $repo (did the Trials run finish, and have the artifacts expired?)"
