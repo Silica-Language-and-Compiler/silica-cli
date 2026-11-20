@@ -92,7 +92,8 @@ ln -sfn "$src" "$bin/silica"
 say "Linked $bin/silica -> $src"
 
 if [ "${SILICA_NO_COMPILER:-0}" != 1 ]; then
-  "$bin/silica" update
+  # The CLI was just installed, so only the compiler, specification and stdlib need fetching.
+  SILICA_SKIP_CLI_UPDATE=1 "$bin/silica" update
 fi
 
 say

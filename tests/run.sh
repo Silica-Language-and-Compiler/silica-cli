@@ -270,9 +270,48 @@ if [ -f "$home/bin/silica-compiler-ESP32_S3_raw.release" ]; then
 fi
 expect "update bad option fails"        1 ""              -- "$cli" update --bogus
 
+# `silica update` updates a CLI that install.sh installed into $SILICA_HOME/cli, then re-runs
+# the update with the new CLI. Served from file:// fixtures; the new CLI is a stub that reports
+# how it was run.
+selfup="$work/selfup"
+mkdir -p "$selfup/home/cli/src" "$selfup/home/bin" "$selfup/dist/silica-cli/src"
+cp "$root/src/silica.sh" "$selfup/home/cli/src/silica.sh"
+ln -s "$selfup/home/cli/src/silica.sh" "$selfup/home/bin/silica"
+cat > "$selfup/dist/silica-cli/src/silica.sh" <<'EOF'
+#!/usr/bin/env bash
+echo "new-cli $* skip=${SILICA_SKIP_CLI_UPDATE:-}"
+EOF
+tar -C "$selfup/dist" -czf "$selfup/dist/silica-cli.tar.gz" silica-cli
+(cd "$selfup/dist" && if command -v sha256sum >/dev/null 2>&1; then sha256sum silica-cli.tar.gz; else shasum -a 256 silica-cli.tar.gz; fi) > "$selfup/dist/silica-cli.tar.gz.sha256"
+selfup_cli() { env SILICA_HOME="$selfup/home" SILICA_CLI_DOWNLOAD_URL="file://$selfup/dist" ${SELFUP_ENV[@]+"${SELFUP_ENV[@]}"} "$selfup/home/bin/silica" "$@"; }
+SELFUP_ENV=()
+expect "update replaces an installed CLI" 0 "new-cli update --host $machine skip=1" -- selfup_cli update --host "$machine"
+if grep -q '^echo "new-cli' "$selfup/home/cli/src/silica.sh"; then
+  pass "installed CLI swapped for the release"
+else
+  fail "installed CLI swapped for the release"
+fi
+# A bad checksum keeps the installed CLI. (The bogus repository then fails the compiler update.)
+cp "$root/src/silica.sh" "$selfup/home/cli/src/silica.sh"
+echo "0000  silica-cli.tar.gz" > "$selfup/dist/silica-cli.tar.gz.sha256"
+SELFUP_ENV=(SILICA_REPO=Silica-Language-and-Compiler/no-such-repo)
+expect "update with a bad CLI checksum fails" 1 ""      -- selfup_cli update
+if grep -q 'checksum mismatch' "$work/stderr" && cmp -s "$root/src/silica.sh" "$selfup/home/cli/src/silica.sh"; then
+  pass "bad CLI checksum keeps the installed CLI"
+else
+  fail "bad CLI checksum keeps the installed CLI" "$(cat "$work/stderr")"
+fi
+
 # `silica update` installs the specification flat into $SILICA_HOME/spec.
 spec_dir="${SILICA_HOME:-$HOME/.silica}/spec"
 expect "update"                         0 ""              -- "$cli" update
+if [ -e "$root/.git" ]; then
+  if grep -F "runs from the checkout at $root" "$work/stderr" >/dev/null; then
+    pass "update leaves a checkout's CLI to git"
+  else
+    fail "update leaves a checkout's CLI to git" "$(cat "$work/stderr")"
+  fi
+fi
 if [ ! -f "$spec_dir/silica-specification.md" ]; then
   fail "specification installed" "no $spec_dir/silica-specification.md"
 elif [ -n "$(find "$spec_dir" -mindepth 1 \( -type d -o \! -name '*.md' \))" ]; then
