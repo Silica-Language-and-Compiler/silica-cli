@@ -4,7 +4,7 @@
 #   silica build <file-or-folder>   compile, assemble and link an executable
 #   silica run   <file-or-folder>   build, then execute it
 #   silica sildat <in> <out>        pack a text file into a Silica store backing
-#   silica update                   update every installed compiler, the specification and stdlib
+#   silica update                   update the CLI, every installed compiler, the specification and stdlib
 #   silica spec [--path]            where the specification is and how to read it (for AI)
 #   silica version                  show which compiler is in use
 #
@@ -54,7 +54,9 @@ Usage: silica <command> [options] <file-or-folder>
 Commands:
   build <path>    Compile <path> (a .silica file or a project folder) to an executable
   run <path>      Build <path>, then execute it (extra args after -- go to the program)
-  update          Bring every compiler in ~/.silica/bin (this machine's and any cross
+  update          Update silica itself to the latest silica-cli release (when it was
+                  installed by install.sh), then bring every compiler in ~/.silica/bin
+                  (this machine's and any cross
                   compilers) up to the latest release, and install the language
                   specification (Markdown) into ~/.silica/spec and the standard
                   library sources into ~/.silica/stdlib. --target/--host also
@@ -85,6 +87,8 @@ Options for build and run:
 Environment:
   SILICA_COMPILER   Use this compiler binary instead of ~/.silica/bin/silica-compiler
   SILICA_HOME       Install root (default: ~/.silica)
+  SILICA_SKIP_CLI_UPDATE
+                    Set to 1 so that `silica update` does not update the CLI itself
   SILICA_STDLIB     A folder of library .silica modules; a `use X;` that is not part of
                     the project is resolved to $SILICA_STDLIB/**/X.silica
                     (default: ~/.silica/stdlib, downloaded when first needed)
@@ -1724,7 +1728,9 @@ Usage: silica update [--host <platform>] [--target <target>]
        silica update --golden [--run <id|url>] [--target <name>]... [--repo <owner/name>]
                               [--silica-dir <path>] [--dry-run]
 
-Without --golden: update the installed compilers, specification and stdlib.
+Without --golden: update silica-cli itself (when install.sh installed it into
+~/.silica/cli; a checkout is left to git), then the installed compilers,
+specification and stdlib. SILICA_SKIP_CLI_UPDATE=1 leaves the CLI as it is.
 
 With --golden: download the golden assembly (*.ascomp, *.scout) that a GitHub
 Actions "Trials" run generated (artifacts golden-<target>-shard-<n>) and install
@@ -1742,9 +1748,91 @@ trial folders that already exist.
 EOF
 }
 
+# The running script's real path, symlinks resolved.
+script_path() {
+  local p="${BASH_SOURCE[0]}" d
+  while [ -L "$p" ]; do
+    d="$(cd "$(dirname "$p")" && pwd -P)"
+    p="$(readlink "$p")"
+    case "$p" in /*) ;; *) p="$d/$p" ;; esac
+  done
+  printf '%s/%s\n' "$(cd "$(dirname "$p")" && pwd -P)" "$(basename "$p")"
+}
+
+# `silica update` first brings the CLI itself up to the latest silica-cli release, when it was
+# installed from one (into $SILICA_HOME/cli, as install.sh does). It then re-runs the update with
+# the new CLI, so the rest of the update uses the new code. A CLI that runs from a checkout is
+# left alone. SILICA_SKIP_CLI_UPDATE=1 skips this step. A failure is a warning: the compilers
+# are still updated.
+#   SILICA_CLI_REPO          repository to update from (as for install.sh)
+#   SILICA_CLI_DOWNLOAD_URL  base URL holding silica-cli.tar.gz(.sha256); always installed (tests)
+update_cli() { # update_cli <update args...>
+  [ "${SILICA_SKIP_CLI_UPDATE:-0}" != 1 ] || return 0
+  local cli_repo="${SILICA_CLI_REPO:-Silica-Language-and-Compiler/silica-cli}"
+  local cli_dir="$SILICA_HOME/cli" self managed base tag json tmp want got
+
+  self="$(script_path)"
+  managed="$(cd "$cli_dir/src" 2>/dev/null && pwd -P)/silica.sh"
+  if [ "$self" != "$managed" ]; then
+    local root; root="$(dirname "$(dirname "$self")")"
+    if [ -e "$root/.git" ]; then
+      info "silica-cli runs from the checkout at $root; update it with: git -C $root pull"
+    else
+      info "silica-cli at $self was not installed by install.sh; not updating it"
+    fi
+    return 0
+  fi
+
+  command -v curl >/dev/null 2>&1 || { warn "curl is required to update silica-cli"; return 1; }
+  command -v tar >/dev/null 2>&1 || { warn "tar is required to update silica-cli"; return 1; }
+  if [ -n "${SILICA_CLI_DOWNLOAD_URL:-}" ]; then
+    base="${SILICA_CLI_DOWNLOAD_URL%/}"; tag="$base"
+  else
+    if ! json="$(http_get "https://api.github.com/repos/$cli_repo/releases/latest")"; then
+      warn "could not query https://github.com/$cli_repo/releases/latest; keeping silica-cli $SILICA_CLI_VERSION"
+      return 1
+    fi
+    tag="$(printf '%s\n' "$json" | sed -n 's/^ *"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)"
+    [ -n "$tag" ] || { warn "the latest release of $cli_repo has no tag name"; return 1; }
+    if [ "$tag" = "$SILICA_CLI_VERSION" ]; then
+      step "Up to date" "silica-cli $tag"
+      return 0
+    fi
+    base="https://github.com/$cli_repo/releases/download/$tag"
+  fi
+
+  step Downloading "silica-cli $tag"
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/silica-cli-update.XXXXXX")"
+  if ! curl -fsSL -o "$tmp/silica-cli.tar.gz" "$base/silica-cli.tar.gz" \
+     || ! curl -fsSL -o "$tmp/silica-cli.tar.gz.sha256" "$base/silica-cli.tar.gz.sha256"; then
+    rm -rf "$tmp"; warn "could not download silica-cli from $base"; return 1
+  fi
+  want="$(cut -d' ' -f1 < "$tmp/silica-cli.tar.gz.sha256")"
+  got="$("${SHA256[@]}" "$tmp/silica-cli.tar.gz" | cut -d' ' -f1)"
+  if [ -z "$want" ] || [ "$want" != "$got" ]; then
+    rm -rf "$tmp"; warn "checksum mismatch for silica-cli.tar.gz (expected $want, got $got)"; return 1
+  fi
+  mkdir -p "$tmp/unpacked"
+  if ! tar -C "$tmp/unpacked" -xzf "$tmp/silica-cli.tar.gz" || [ ! -f "$tmp/unpacked/silica-cli/src/silica.sh" ]; then
+    rm -rf "$tmp"; warn "the silica-cli archive has no silica-cli/src/silica.sh"; return 1
+  fi
+  chmod +x "$tmp/unpacked/silica-cli/src/silica.sh"
+
+  # Swap whole folders. This bash keeps reading its script through an open file, so moving the
+  # old folder away does not disturb it; the new CLI takes over at the exec below.
+  mv "$cli_dir" "$tmp/old" || { rm -rf "$tmp"; warn "could not replace $cli_dir"; return 1; }
+  if ! mv "$tmp/unpacked/silica-cli" "$cli_dir"; then
+    mv "$tmp/old" "$cli_dir"; rm -rf "$tmp"; warn "could not replace $cli_dir"; return 1
+  fi
+  rm -rf "$tmp"
+  step Installed "silica-cli $tag in $cli_dir"
+  SILICA_SKIP_CLI_UPDATE=1 exec bash "$cli_dir/src/silica.sh" update "$@"
+}
+
 # `silica update [--host <platform>] [--target <target>]`, or `silica update --golden ...`
 cmd_update() {
   local host_opt="" target_opt="" arg
+  local args=("$@")
   local rest=() golden=0
   for arg in "$@"; do
     if [ "$arg" = --golden ]; then golden=1; else rest+=("$arg"); fi
@@ -1767,7 +1855,10 @@ cmd_update() {
   done
   SEL_LINK=""
   if [ -n "$host_opt$target_opt" ]; then select_compiler "$host_opt" "$target_opt"; fi
-  install_latest_release
+  local ec=0
+  update_cli ${args[@]+"${args[@]}"} || ec=1
+  install_latest_release || ec=1
+  return "$ec"
 }
 
 main() {
